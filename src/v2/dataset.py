@@ -1,6 +1,7 @@
 # dataset.py
 import torch
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
+from src.arguments import TrainingConfig
 from src.dataset import EventSequenceDataLoaderMeta
 
 
@@ -31,7 +32,7 @@ class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):
                 # tokenize the event
                 timestamp, event = event
                 prompt = self.prefix_prompt + event + self.config.EVENT_TOEKN
-                tokens = self.tokenizer.encode(prompt)[-self.max_text_len:]
+                tokens = self.tokenizer.encode(prompt)
                 pos_events_tokens.append(tokens[:self.max_text_len])
                 time_ids.append(timestamp)
 
@@ -39,7 +40,7 @@ class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):
                 # tokenize the event
                 timestamp, event = event
                 prompt = self.prefix_prompt + event + self.config.EVENT_TOEKN
-                tokens = self.tokenizer.encode(prompt)[-self.max_text_len:]
+                tokens = self.tokenizer.encode(prompt)
                 neg_events_tokens.append(tokens[:self.max_text_len])
 
         # pad tokens and create attention mask

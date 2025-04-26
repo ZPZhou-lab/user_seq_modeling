@@ -1,5 +1,5 @@
 from .dataset import TextEventSequencePairDataLoader
-from .hllm import EventEncoder
+from .event_encoder import EventEncoder
 
 __all__ = [
     'TextEventSequencePairDataLoader',
