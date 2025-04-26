@@ -8,8 +8,8 @@ import time
 config = TrainingConfig(
     data_dir='./data',
     model_path='../../models/TinyLlama-1.1B-3T/',
-    batch_size=4,
-    max_seq_len=32,
+    batch_size=2,
+    max_seq_len=64,
     max_text_len=32,
     num_negatives=128
 )
@@ -35,23 +35,25 @@ if __name__ == '__main__':
     )
 
     s = time.time()
-    for i in range(1):
+    for i in range(5):
         batch = train_loader.next_batch()
         pos_hidden_states, attention_mask = event_encoder(
             input_ids=batch['pos_input_ids'],
             event_len=batch['pos_event_len'],
             padding=True
         )
-        print(attention_mask[0])
-        print(pos_hidden_states.shape)
-        print(pos_hidden_states[0][1:5])
+        neg_hidden_states, _ = event_encoder(
+            input_ids=batch['neg_input_ids'],
+            event_len=batch['neg_event_len'],
+            padding=True
+        )
 
         # call user encoder
         predictions = user_encoder(
             event_embeddings=pos_hidden_states,
             attention_mask=attention_mask
         )
-        print(predictions.shape) # (batch, max_seq_len, hidden)
+        print(predictions[0][-1])
     
     e = time.time()
     print(f"Time taken for 5 iterations: {e - s:.2f} seconds")
