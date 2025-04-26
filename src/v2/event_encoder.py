@@ -78,7 +78,8 @@ class EventEncoder(nn.Module):
 
     def _extract_hidden_states(self, 
         input_ids: torch.Tensor, 
-        attention_mask: torch.Tensor
+        attention_mask: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         call llm to extract hidden states
@@ -86,7 +87,8 @@ class EventEncoder(nn.Module):
         # get embedding
         outputs = self.llm.base_model(
             input_ids=input_ids.to(self.llm.device),
-            attention_mask=attention_mask.to(self.llm.device, dtype=torch.bool)
+            attention_mask=attention_mask.to(self.llm.device, dtype=torch.bool),
+            # position_ids=position_ids.to(self.llm.device) if position_ids is not None else None,
         )
         # extract the last token hidden state
         return outputs.last_hidden_state[:, -1, :] 

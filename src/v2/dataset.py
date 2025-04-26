@@ -52,6 +52,15 @@ class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):
             encoded_inputs={'input_ids': neg_events_tokens}, 
             padding='max_length', max_length=self.max_text_len, return_tensors='pt',
         )
+        # add position ids
+        # pos_input_ids['position_ids'] = torch.stack([
+        #     torch.as_tensor([0] * (self.max_text_len - seq_len) + list(range(seq_len)), dtype=torch.long)
+        #     for seq_len in pos_input_ids['attention_mask'].sum(dim=1)])
+        # neg_input_ids['position_ids'] = torch.stack([
+        #     torch.as_tensor([0] * (self.max_text_len - seq_len) + list(range(seq_len)), dtype=torch.long)
+        #     for seq_len in neg_input_ids['attention_mask'].sum(dim=1)])
+        pos_input_ids['position_ids'] = None
+        neg_input_ids['position_ids'] = None
 
         return {
             'pos_input_ids':    pos_input_ids,

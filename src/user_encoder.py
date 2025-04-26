@@ -30,7 +30,7 @@ class UserEncoder(nn.Module):
         # get embedding
         outputs = self.encoder(
             inputs_embeds=event_embeddings,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask.to(self.encoder.device),
             use_cache=False,
             output_hidden_states=False,
             output_attentions=False

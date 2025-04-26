@@ -30,7 +30,7 @@ class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):
                 timestamp, event = event
                 # create the event token
                 prompt = self.prefix_prompt + event + self.config.EVENT_TOEKN
-                tokens = self.tokenizer.encode(prompt)[-self.max_text_len:]
+                tokens = self.tokenizer.encode(prompt)[:self.max_text_len]
                 pos_tokens.extend(tokens)
                 pos_varlen.append(len(tokens))
                 pos_position_ids.extend((torch.arange(len(tokens)) + (self.max_text_len - len(tokens))).tolist())
@@ -42,7 +42,7 @@ class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):
                 timestamp, event = event
                 # create the event token
                 prompt = self.prefix_prompt + event + self.config.EVENT_TOEKN
-                tokens = self.tokenizer.encode(prompt)[-self.max_text_len:]
+                tokens = self.tokenizer.encode(prompt)[:self.max_text_len]
                 neg_tokens.extend(tokens)
                 neg_varlen.append(len(tokens))
                 neg_position_ids.extend((torch.arange(len(tokens)) + (self.max_text_len - len(tokens))).tolist())

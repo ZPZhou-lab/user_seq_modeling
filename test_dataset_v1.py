@@ -1,8 +1,8 @@
 import torch
 from src.arguments import TrainingConfig
 from src.user_encoder import UserEncoder
-from src.v2 import TextEventSequencePairDataLoader
-from src.v2 import EventEncoder
+from src.v1 import TextEventSequencePairDataLoader
+from src.v1 import EventEncoder
 import time
 
 config = TrainingConfig(
@@ -27,7 +27,7 @@ if __name__ == '__main__':
     event_encoder = EventEncoder(
         model_path=config.model_path,
         max_seq_len=config.max_seq_len,
-        use_flash_attention=False
+        use_flash_attention=True
     )
     # build user encoder
     user_encoder = UserEncoder(
@@ -37,21 +37,21 @@ if __name__ == '__main__':
     s = time.time()
     for i in range(1):
         batch = train_loader.next_batch()
-        pos_hidden_states, attention_mask = event_encoder(
+        pos_hidden_states = event_encoder(
             input_ids=batch['pos_input_ids'],
-            event_len=batch['pos_event_len'],
-            padding=True
+            position_ids=batch['pos_position_ids'],
+            seq_varlen=batch['pos_varlen']
         )
-        print(attention_mask[0])
+        print(batch['attention_mask'][0])
         print(pos_hidden_states.shape)
         print(pos_hidden_states[0][1:5])
 
         # call user encoder
         predictions = user_encoder(
             event_embeddings=pos_hidden_states,
-            attention_mask=attention_mask
+            attention_mask=batch['attention_mask']
         )
-        print(predictions.shape) # (batch, max_seq_len, hidden)
+        print(predictions.shape)
     
     e = time.time()
     print(f"Time taken for 5 iterations: {e - s:.2f} seconds")
