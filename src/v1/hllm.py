@@ -1,6 +1,8 @@
-import os
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import sys
+if sys.platform == "darwin":
+    import os
+    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM
 import torch
 from torch import nn
@@ -14,63 +16,68 @@ class EventEncoder(nn.Module):
     """
     def __init__(self, 
         model_path: str,
-        prefix_prompt: Optional[str] = '',
+        max_seq_len: int,
     ):
         super(EventEncoder, self).__init__()
         # load tokenizer and llm
-        self.EVENT_TOKEN = '[EVENT]'
-        self.prefix_prompt = prefix_prompt
+        self.max_seq_len = max_seq_len
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.use_cache = False
         self.llm = AutoModelForCausalLM.from_pretrained(
             model_path, 
+            config=config,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True
         )
-        # add special tokens [PAD] and [EVENT]
-        self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.tokenizer.add_tokens(self.EVENT_TOKEN, special_tokens=True)
-        self.tokenizer.padding_side = 'left'
         # add new embed_tokens to the llm
-        self.llm.resize_token_embeddings(len(self.tokenizer), mean_resizing=True)
+        self.llm.resize_token_embeddings(len(self.tokenizer) + 2, mean_resizing=True)
 
 
-    def forward(self, events: Union[List[str], List[List[str]]]):
+    def forward(self, 
+        input_ids: torch.Tensor, 
+        position_ids: torch.Tensor, 
+        seq_varlen: torch.Tensor
+    ) -> torch.Tensor:
         """
         encode events into hidden_states, a special token `[EVENT]` is padded to the end of each event
         and the last hidden_state of the sequence(i.e. the embedding of last token `[EVENT]`) is returned.
 
         Parameters
         ----------
-        events: List[str] or List[List[str]]
-            events to be encoded, each event is a string or a list of strings(batch of events)
+        input_ids: torch.Tensor
+            The tokenized events with shape (sql_len, )
+        position_ids: torch.Tensor
+            The position ids of the events with shape (sql_len, )
+        seq_varlen: torch.Tensor
+            The variable length of the event sequences with shape (batch, )
         """
-        if isinstance(events[0], str):
-            events = [events]
-        # tokenize events
-        events_len = []
-        events_tokens = []
-        for event_seq in events:
-            events_len.append(len(event_seq)) # record the length of each event sequence
-            for event in event_seq:
-                # tokenize event
-                prompt = self.prefix_prompt + event + self.EVENT_TOKEN
-                tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
-                events_tokens.append(tokens)
-        # pad tokens and create attention mask
-        input_ids = self.tokenizer.pad(
-            encoded_inputs={'input_ids': events_tokens},
-            padding=True,
-            return_tensors='pt',
-        )
-        
-        # call llm to extract hidden states with shape (num_events_agg, hidden_size)
-        hidden_states = self._extract_hidden_states(**input_ids)
+        # get the event_embeddings
+        hidden_states = self.llm.get_input_embeddings()(input_ids.to(self.llm.device))
+        seq_len, embed_size = hidden_states.size(0), hidden_states.size(1)
 
-        # split hidden states into event sequences and create attention mask
-        hidden_states = hidden_states.split(events_len, dim=0) # (batch, num_events, hidden_size)
-        # padding hidden states to the max length
-        return self._padding_hidden_states(hidden_states, events_len)
+        # create attention mask
+        attn_mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+        varlen_cum = F.pad(seq_varlen.cumsum(dim=0), (1, 0), value=0)
+        for i in range(1, len(varlen_cum)):
+            s, e = varlen_cum[i-1], varlen_cum[i]
+            # set the attn_mask[s:e, s:e] to a lower triangular matrix
+            attn_mask[s:e, s:e] = torch.tril(torch.ones(e-s, e-s, dtype=torch.bool))
+        
+        # call llm to extract hidden states
+        hidden_states = self.llm.base_model(
+            inputs_embeds=hidden_states.unsqueeze(0),
+            position_ids=position_ids.unsqueeze(0).to(self.llm.device),
+            attention_mask=attn_mask.unsqueeze(0).to(self.llm.device),
+            use_cache=False
+        ).last_hidden_state.squeeze(0)  # (seq_len, hidden_size)
+        # extract the last token hidden state
+        # and reshape to (batch, max_len, hidden_size)
+        hidden_states = hidden_states[varlen_cum[1:] - 1]
+        hidden_states = hidden_states.view(-1, self.max_seq_len, embed_size)
+
+        return hidden_states
 
 
     def _extract_hidden_states(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
