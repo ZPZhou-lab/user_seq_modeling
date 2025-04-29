@@ -13,12 +13,12 @@ class UserEncoder(nn.Module):
         # load pretrained llm
         llm = AutoModelForCausalLM.from_pretrained(
             model_path, 
-            torch_dtype=torch.bfloat16,
+            torch_dtype='auto',
             device_map="auto",
             trust_remote_code=True
         )
         # remove embedding layer and only keep the encoder
-        self.encoder = llm.base_model
+        self.llm = llm.base_model
     
     def forward(self, 
         event_embeddings: torch.Tensor, 
@@ -28,9 +28,9 @@ class UserEncoder(nn.Module):
         encode user inputs into hidden_states
         """
         # get embedding
-        outputs = self.encoder(
+        outputs = self.llm(
             inputs_embeds=event_embeddings,
-            attention_mask=attention_mask.to(self.encoder.device),
+            attention_mask=attention_mask.to(self.llm.device),
             use_cache=False,
             output_hidden_states=False,
             output_attentions=False

@@ -31,8 +31,7 @@ class EventEncoder(nn.Module):
         self.llm = CustomLlamaForCausalLM.from_pretrained(
             model_path, 
             config=hf_config,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            torch_dtype='auto', device_map="auto"
         )
         # add new embed_tokens to the llm
         self.llm.resize_token_embeddings(len(self.tokenizer) + 2, mean_resizing=True)

@@ -34,31 +34,36 @@ if __name__ == '__main__':
         model_path=config.model_path,
     )
 
-    s = time.time()
-    for i in range(5):
-        batch = train_loader.next_batch()
-        pos_hidden_states = event_encoder(
-            input_ids=batch['pos_input_ids'],
-            position_ids=batch['pos_position_ids'],
-            seq_varlen=batch['pos_varlen']
-        )
-        neg_hidden_states = event_encoder(
-            input_ids=batch['neg_input_ids'],
-            position_ids=batch['neg_position_ids'],
-            seq_varlen=batch['neg_varlen']
-        )
-        # print(batch['attention_mask'][0])
-        # print(pos_hidden_states.shape)
-        # print(pos_hidden_states[0][1:5])
+    # transform into bfloat16
+    event_encoder.llm = event_encoder.llm.to(torch.bfloat16)
+    user_encoder.llm = user_encoder.llm.to(torch.bfloat16)
 
-        # call user encoder
-        predictions = user_encoder(
-            event_embeddings=pos_hidden_states,
-            attention_mask=batch['attention_mask']
-        )
-        print(batch['pos_input_ids'].shape)
-        print(batch['neg_input_ids'].shape)
-        print(predictions[0][-1])
+    s = time.time()
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        for i in range(5):
+            batch = train_loader.next_batch()
+            pos_hidden_states = event_encoder(
+                input_ids=batch['pos_input_ids'],
+                position_ids=batch['pos_position_ids'],
+                seq_varlen=batch['pos_varlen']
+            )
+            neg_hidden_states = event_encoder(
+                input_ids=batch['neg_input_ids'],
+                position_ids=batch['neg_position_ids'],
+                seq_varlen=batch['neg_varlen']
+            )
+            # print(batch['attention_mask'][0])
+            # print(pos_hidden_states.shape)
+            # print(pos_hidden_states[0][1:5])
+
+            # call user encoder
+            predictions = user_encoder(
+                event_embeddings=pos_hidden_states,
+                attention_mask=batch['attention_mask']
+            )
+            print(batch['pos_input_ids'].shape)
+            print(batch['neg_input_ids'].shape)
+            print(predictions[0][-1])
     
     e = time.time()
     print(f"Time taken for 10 iterations: {e - s:.2f} seconds")
