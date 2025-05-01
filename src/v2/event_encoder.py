@@ -1,12 +1,11 @@
 import sys
+import os
 if sys.platform == 'darwin':
-    import os
     os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM
 import torch
 from torch import nn
-import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Optional, Dict, List, Tuple
 from src.arguments import ModelPath
 
@@ -22,6 +21,16 @@ class EventEncoder(nn.Module):
         num_add_tokens: int = 2,
     ):
         super(EventEncoder, self).__init__()
+        # create device
+        if dist.is_initialized():
+            local_rank = int(os.environ["LOCAL_RANK"])
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            local_rank = 0
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.local_rank = local_rank
+        self.device = device
         # load tokenizer and llm
         self.EVENT_TOKEN = '[EVENT]'
         self.max_seq_len = max_seq_len
@@ -39,9 +48,9 @@ class EventEncoder(nn.Module):
             model_path.value, 
             config=hf_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=self.device,
             trust_remote_code=True
-        )
+        ).to(self.device)
         # add new embed_tokens to the llm
         self.llm.resize_token_embeddings(len(self.tokenizer) + num_add_tokens, mean_resizing=True)
 

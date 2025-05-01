@@ -1,6 +1,8 @@
+import os
 import torch
+import torch.distributed as dist
 from src.arguments import TrainingConfig
-from src.user_encoder import UserEncoder
+from src.user_encoder import UserEncoder, GenerativeInfoNCELoss
 from src.v1 import TextEventSequencePairDataLoader
 from src.v1 import EventEncoder
 from src.arguments import ModelPath
@@ -15,14 +17,35 @@ config = TrainingConfig(
     num_negatives=64
 )
 
+def worker_setup(ddp: int, seed: int=42):
+    if ddp:
+        dist.init_process_group(backend='nccl')
+        ddp_rank, ddp_local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        device = f'cuda:{ddp_local_rank}'
+        master_process = ddp_rank == 0 # master do logging
+    else:
+        # use single GPU training
+        ddp_rank, ddp_local_rank = 0, 0
+        ddp_world_size = 1
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    torch.cuda.set_device(device)
+    # fix random seed
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    
+    return ddp_rank, ddp_local_rank, ddp_world_size, device, master_process
+
 
 if __name__ == '__main__':
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    # setup worker
+    ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = worker_setup(ddp, 42)
+
     # build data loader
     train_loader = TextEventSequencePairDataLoader(config, rank=0)
-    # fix random seed
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
 
     # build event encoder
     event_encoder = EventEncoder(
@@ -32,10 +55,11 @@ if __name__ == '__main__':
     )
     # build user encoder
     user_encoder = UserEncoder(model_path=config.model_path)
-
-    # transform into bfloat16
-    event_encoder.llm = event_encoder.llm.to(torch.bfloat16)
-    user_encoder.llm = user_encoder.llm.to(torch.bfloat16)
+    # build loss function
+    nce_loss_func = GenerativeInfoNCELoss(
+        temperature=0.05,
+        nce_threshold=0.99
+    )
 
     s = time.time()
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -61,6 +85,18 @@ if __name__ == '__main__':
                 attention_mask=batch['attention_mask']
             )
             print(predictions[0][-1])
+
+            # call loss function
+            nce_loss = nce_loss_func(
+                predictions=predictions, 
+                positives=pos_hidden_states, 
+                negatives=neg_hidden_states,
+                attention_mask=batch['attention_mask'] 
+            )
+            print(nce_loss)
     
     e = time.time()
     print(f"Time taken for 10 iterations: {e - s:.2f} seconds")
+
+    # destroy process group
+    dist.destroy_process_group() if ddp else None

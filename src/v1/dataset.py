@@ -58,5 +58,3 @@ class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):
             'time_ids':         time_ids,
             'labels':           torch.as_tensor(labels, dtype=torch.int32),
         }
-
-        

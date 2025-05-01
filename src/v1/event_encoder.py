@@ -1,16 +1,15 @@
 import sys
+import os
 if sys.platform == "darwin":
-    import os
     os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM
+from transformers import AutoTokenizer, AutoConfig
 from .modeling.modeling_llama import LlamaForCausalLM as CustomLlamaForCausalLM
 from .modeling.modeling_qwen3 import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from typing import Optional, Dict, Any, List, Union
+from typing import Any
 from src.arguments import ModelPath
 
 
@@ -25,6 +24,16 @@ class EventEncoder(nn.Module):
         num_add_tokens: int = 2
     ):
         super(EventEncoder, self).__init__()
+        # create device
+        if dist.is_initialized():
+            local_rank = int(os.environ["LOCAL_RANK"])
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            local_rank = 0
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.local_rank = local_rank
+        self.device = device
         # load tokenizer and llm
         self.max_seq_len = max_seq_len
         self.num_add_tokens = num_add_tokens
@@ -39,19 +48,19 @@ class EventEncoder(nn.Module):
         """
         Create a pretrained model from the given model path.
         """
+        print(f"Loading {model_path.name} Event model...")
         if model_path.name.startswith("Qwen3"):
-            print("Loading Qwen3 Event model...")
             self.llm = CustomQwen3ForCausalLM.from_pretrained(
                 model_path.value,
                 config=hf_config,
-                torch_dtype='auto', device_map='auto'
-            )
+                torch_dtype='auto', device_map=self.device
+            ).to(self.device)
         elif model_path.name.startswith("TinyLlama"):
             self.llm = CustomLlamaForCausalLM.from_pretrained(
                 model_path.value,
                 config=hf_config,
-                torch_dtype='auto', device_map='auto'
-            )
+                torch_dtype='auto', device_map=self.device
+            ).to(self.device)
         # add new embed_tokens to the llm
         self.llm.resize_token_embeddings(len(self.tokenizer) + self.num_add_tokens, mean_resizing=True)
 
