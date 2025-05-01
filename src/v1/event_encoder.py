@@ -5,10 +5,13 @@ if sys.platform == "darwin":
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM
 from .modeling.modeling_llama import LlamaForCausalLM as CustomLlamaForCausalLM
+from .modeling.modeling_qwen3 import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Optional, Dict, Any, List, Union
+from src.arguments import ModelPath
 
 
 class EventEncoder(nn.Module):
@@ -16,25 +19,41 @@ class EventEncoder(nn.Module):
     Encodes events sequences into hidden_states
     """
     def __init__(self, 
-        model_path: str,
+        model_path: ModelPath,
         max_seq_len: int,
-        use_flash_attention: bool = False
+        use_flat_flash_attention: bool = True,
+        num_add_tokens: int = 2
     ):
         super(EventEncoder, self).__init__()
         # load tokenizer and llm
         self.max_seq_len = max_seq_len
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        self.num_add_tokens = num_add_tokens
+        hf_config = AutoConfig.from_pretrained(model_path.value, trust_remote_code=True)
         hf_config.use_cache = False
         hf_config.return_dict = True
-        hf_config.use_ft_flash_attn = use_flash_attention
-        self.llm = CustomLlamaForCausalLM.from_pretrained(
-            model_path, 
-            config=hf_config,
-            torch_dtype='auto', device_map="auto"
-        )
+        hf_config.use_ft_flash_attn = use_flat_flash_attention
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path.value, trust_remote_code=True)
+        self.create_pretrained_model(model_path, hf_config)
+
+    def create_pretrained_model(self, model_path: ModelPath, hf_config: Any):
+        """
+        Create a pretrained model from the given model path.
+        """
+        if model_path.name.startswith("Qwen3"):
+            print("Loading Qwen3 Event model...")
+            self.llm = CustomQwen3ForCausalLM.from_pretrained(
+                model_path.value,
+                config=hf_config,
+                torch_dtype='auto', device_map='auto'
+            )
+        elif model_path.name.startswith("TinyLlama"):
+            self.llm = CustomLlamaForCausalLM.from_pretrained(
+                model_path.value,
+                config=hf_config,
+                torch_dtype='auto', device_map='auto'
+            )
         # add new embed_tokens to the llm
-        self.llm.resize_token_embeddings(len(self.tokenizer) + 2, mean_resizing=True)
+        self.llm.resize_token_embeddings(len(self.tokenizer) + self.num_add_tokens, mean_resizing=True)
 
     def forward(self, 
         input_ids: torch.Tensor, 

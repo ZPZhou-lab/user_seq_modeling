@@ -150,7 +150,7 @@ ACT2CLS = {
     "relu": nn.ReLU,
     "relu6": nn.ReLU6,
     "sigmoid": nn.Sigmoid,
-    "silu": SiLUActivation,
+    "silu": nn.SiLU,
     "swish": SiLUActivation,
     "tanh": nn.Tanh,
 }

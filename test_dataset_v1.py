@@ -3,15 +3,16 @@ from src.arguments import TrainingConfig
 from src.user_encoder import UserEncoder
 from src.v1 import TextEventSequencePairDataLoader
 from src.v1 import EventEncoder
+from src.arguments import ModelPath
 import time
 
 config = TrainingConfig(
     data_dir='./data',
-    model_path='../../models/TinyLlama-1.1B-3T/',
+    model_path=ModelPath.Qwen3_1B,
     batch_size=2,
-    max_seq_len=64,
+    max_seq_len=32,
     max_text_len=32,
-    num_negatives=128
+    num_negatives=64
 )
 
 
@@ -27,12 +28,10 @@ if __name__ == '__main__':
     event_encoder = EventEncoder(
         model_path=config.model_path,
         max_seq_len=config.max_seq_len,
-        use_flash_attention=True
+        use_flat_flash_attention=True
     )
     # build user encoder
-    user_encoder = UserEncoder(
-        model_path=config.model_path,
-    )
+    user_encoder = UserEncoder(model_path=config.model_path)
 
     # transform into bfloat16
     event_encoder.llm = event_encoder.llm.to(torch.bfloat16)
@@ -61,8 +60,6 @@ if __name__ == '__main__':
                 event_embeddings=pos_hidden_states,
                 attention_mask=batch['attention_mask']
             )
-            print(batch['pos_input_ids'].shape)
-            print(batch['neg_input_ids'].shape)
             print(predictions[0][-1])
     
     e = time.time()

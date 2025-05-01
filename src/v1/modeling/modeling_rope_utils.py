@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+from functools import wraps
 from typing import Optional, Tuple
 
 from transformers.configuration_utils import PretrainedConfig
@@ -25,6 +26,87 @@ logger = logging.get_logger(__name__)
 
 if is_torch_available():
     import torch
+
+
+def dynamic_rope_update(rope_forward):
+    """
+    Decorator function to update the RoPE parameters in the forward pass, if the model is using a dynamic RoPE
+    (i.e. a RoPE implementation that may recompute its frequencies in the forward pass).
+
+    Args:
+        rope_forward (Callable):
+            The forward pass of the RoPE implementation.
+
+    Returns:
+        The decorated forward pass.
+    """
+
+    def longrope_frequency_update(self, position_ids, device):
+        """Longrope uses long factor if sequence is larger than original pretraining length, short otherwise."""
+        seq_len = torch.max(position_ids) + 1
+        if hasattr(self.config, "original_max_position_embeddings"):
+            original_max_position_embeddings = self.config.original_max_position_embeddings
+        else:
+            original_max_position_embeddings = self.config.max_position_embeddings
+        if seq_len > original_max_position_embeddings:
+            if not hasattr(self, "long_inv_freq"):
+                self.long_inv_freq, _ = self.rope_init_fn(
+                    self.config, device, seq_len=original_max_position_embeddings + 1
+                )
+            self.register_buffer("inv_freq", self.long_inv_freq, persistent=False)
+        else:
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+
+    def dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @wraps(rope_forward)
+    def wrapper(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            dynamic_frequency_update(self, position_ids, device=x.device)
+        elif self.rope_type == "longrope":
+            longrope_frequency_update(self, position_ids, device=x.device)
+        return rope_forward(self, x, position_ids)
+
+    return wrapper
+
+
+def rope_config_validation(config: PretrainedConfig, ignore_keys: Optional[set] = None):
+    """
+    Validate the RoPE config arguments, given a `PretrainedConfig` object
+    """
+    rope_scaling = getattr(config, "rope_scaling", None)  # not a default parameter in `PretrainedConfig`
+    if rope_scaling is None:
+        return
+
+    # BC: "rope_type" was originally "type"
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+    validation_fn = ROPE_VALIDATION_FUNCTIONS.get(rope_type)
+    if validation_fn is not None:
+        validation_fn(config, ignore_keys=ignore_keys)
+    else:
+        logger.warning(
+            f"Missing validation function mapping in `ROPE_VALIDATION_FUNCTIONS` for 'rope_type'='{rope_type}'"
+        )
 
 
 def _compute_default_rope_parameters(

@@ -3,17 +3,22 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalL
 import torch
 from torch import nn
 import torch.nn.functional as F
+from .arguments import ModelPath
 
 
 class UserEncoder(nn.Module):
     def __init__(self,
-        model_path: str,
+        model_path: ModelPath,
     ):
         super(UserEncoder, self).__init__()
         # load pretrained llm
+        hf_config = AutoConfig.from_pretrained(model_path.value, trust_remote_code=True)
+        hf_config.use_cache = False
+        hf_config.return_dict = True
         llm = AutoModelForCausalLM.from_pretrained(
-            model_path, 
-            torch_dtype='auto',
+            model_path.value, 
+            config=hf_config,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True
         )

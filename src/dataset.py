@@ -31,7 +31,7 @@ class EventSequenceDataLoaderMeta:
         self.max_text_len   = config.max_text_len
         # create tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path, trust_remote_code=True)
+            self.model_path.value, trust_remote_code=True)
         # add special tokens
         self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.tokenizer.add_tokens(config.EVENT_TOEKN, special_tokens=True)

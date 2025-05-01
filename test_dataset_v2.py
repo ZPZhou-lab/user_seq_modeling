@@ -1,5 +1,5 @@
 import torch
-from src.arguments import TrainingConfig
+from src.arguments import ModelPath, TrainingConfig
 from src.user_encoder import UserEncoder
 from src.v2 import TextEventSequencePairDataLoader
 from src.v2 import EventEncoder
@@ -7,11 +7,11 @@ import time
 
 config = TrainingConfig(
     data_dir='./data',
-    model_path='../../models/TinyLlama-1.1B-3T/',
+    model_path=ModelPath.Qwen3_1B,
     batch_size=2,
-    max_seq_len=64,
+    max_seq_len=32,
     max_text_len=32,
-    num_negatives=128
+    num_negatives=64
 )
 
 
@@ -27,12 +27,10 @@ if __name__ == '__main__':
     event_encoder = EventEncoder(
         model_path=config.model_path,
         max_seq_len=config.max_seq_len,
-        use_flash_attention=False
+        use_flash_attention=True
     )
     # build user encoder
-    user_encoder = UserEncoder(
-        model_path=config.model_path,
-    )
+    user_encoder = UserEncoder(model_path=config.model_path)
 
     s = time.time()
     for i in range(5):
@@ -45,7 +43,7 @@ if __name__ == '__main__':
         neg_hidden_states, _ = event_encoder(
             input_ids=batch['neg_input_ids'],
             event_len=batch['neg_event_len'],
-            padding=True
+            padding=False
         )
 
         # call user encoder
