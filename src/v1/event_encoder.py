@@ -7,10 +7,9 @@ from .modeling.modeling_llama import LlamaForCausalLM as CustomLlamaForCausalLM
 from .modeling.modeling_qwen3 import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 import torch
 from torch import nn
-import torch.nn.functional as F
-import torch.distributed as dist
 from typing import Any
 from src.arguments import ModelPath
+from src.common import create_device_info
 
 
 class EventEncoder(nn.Module):
@@ -25,15 +24,8 @@ class EventEncoder(nn.Module):
     ):
         super(EventEncoder, self).__init__()
         # create device
-        if dist.is_initialized():
-            local_rank = int(os.environ["LOCAL_RANK"])
-            device = torch.device(f'cuda:{local_rank}')
-        else:
-            local_rank = 0
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        self.local_rank = local_rank
-        self.device = device
+        self.local_rank, self.device = create_device_info()
+
         # load tokenizer and llm
         self.max_seq_len = max_seq_len
         self.num_add_tokens = num_add_tokens
@@ -43,7 +35,10 @@ class EventEncoder(nn.Module):
         hf_config.use_ft_flash_attn = use_flat_flash_attention
         self.tokenizer = AutoTokenizer.from_pretrained(model_path.value, trust_remote_code=True)
         self.create_pretrained_model(model_path, hf_config)
-
+        # remove lm head
+        self.llm.lm_head = None
+        delattr(self.llm, 'lm_head')
+    
     def create_pretrained_model(self, model_path: ModelPath, hf_config: Any):
         """
         Create a pretrained model from the given model path.
@@ -99,3 +94,15 @@ class EventEncoder(nn.Module):
         hidden_states = hidden_states.view(-1, self.max_seq_len, embed_size)
 
         return hidden_states
+
+    def save_pretrained(self, save_path: str):
+        """
+        Save the pretrained model to the given path.
+        """
+        self.llm.save_pretrained(save_path)
+
+    def from_pretrained(self, model_path: str):
+        """
+        Load the pretrained model from the given path.
+        """
+        self.llm = self.llm.from_pretrained(model_path)

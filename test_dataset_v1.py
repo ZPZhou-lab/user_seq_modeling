@@ -1,11 +1,11 @@
 import os
 import torch
 import torch.distributed as dist
-from src.arguments import TrainingConfig
-from src.user_encoder import UserEncoder, GenerativeInfoNCELoss
+from src.arguments import TrainingConfig, ModelPath
+from src.user_encoder import UserEncoder
 from src.v1 import TextEventSequencePairDataLoader
 from src.v1 import EventEncoder
-from src.arguments import ModelPath
+from src.hierarchical import HierarchicalModel
 import time
 
 config = TrainingConfig(
@@ -28,7 +28,8 @@ def worker_setup(ddp: int, seed: int=42):
         # use single GPU training
         ddp_rank, ddp_local_rank = 0, 0
         ddp_world_size = 1
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        master_process = True
     
     torch.cuda.set_device(device)
     # fix random seed
@@ -55,45 +56,24 @@ if __name__ == '__main__':
     )
     # build user encoder
     user_encoder = UserEncoder(model_path=config.model_path)
-    # build loss function
-    nce_loss_func = GenerativeInfoNCELoss(
-        temperature=0.05,
-        nce_threshold=0.99
+    model = HierarchicalModel(
+        event_encoder=event_encoder,
+        user_encoder=user_encoder,
+        num_classes=1
     )
+    model.to(device)
+    optimizer = model.build_optimizer()
+
 
     s = time.time()
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         for i in range(5):
             batch = train_loader.next_batch()
-            pos_hidden_states = event_encoder(
-                input_ids=batch['pos_input_ids'],
-                position_ids=batch['pos_position_ids'],
-                seq_varlen=batch['pos_varlen']
-            )
-            neg_hidden_states = event_encoder(
-                input_ids=batch['neg_input_ids'],
-                position_ids=batch['neg_position_ids'],
-                seq_varlen=batch['neg_varlen']
-            )
-            # print(batch['attention_mask'][0])
-            # print(pos_hidden_states.shape)
-            # print(pos_hidden_states[0][1:5])
-
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             # call user encoder
-            predictions = user_encoder(
-                event_embeddings=pos_hidden_states,
-                attention_mask=batch['attention_mask']
-            )
-            print(predictions[0][-1])
-
-            # call loss function
-            nce_loss = nce_loss_func(
-                predictions=predictions, 
-                positives=pos_hidden_states, 
-                negatives=neg_hidden_states,
-                attention_mask=batch['attention_mask'] 
-            )
-            print(nce_loss)
+            outputs = model(**batch)
+            # print(user_outputs.hidden_states[0][-1])
+            print(outputs.nce_loss, outputs.ce_loss)
     
     e = time.time()
     print(f"Time taken for 10 iterations: {e - s:.2f} seconds")

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-
+from datetime import datetime
 
 class ModelPath(Enum):
     """
@@ -14,10 +14,31 @@ class ModelPath(Enum):
 
 @dataclass
 class TrainingConfig:
-    data_dir: str
+    train_data_dir: str
+    valid_data_dir: str
     model_path: ModelPath
     batch_size: int = 16
     max_seq_len: int = 64
     max_text_len: int = 32
     num_negatives: int = 256
     EVENT_TOEKN: str = '[EVENT]'
+    # training args
+    name: str = 'experiment'
+    log_dir: str = './logs'
+    save_dir: str = './checkpoints'
+    learning_rate: float = 1e-5
+    warm_up_steps: int  = 100
+    max_steps: int      = 10000
+    log_freq: int       = 100
+    eval_steps: int     = 100
+    temprature: float   = 0.05
+    nce_threshold: float = 0.99
+    nce_loss_lambda: float = 0.5
+
+    def get_log_dir(self):
+        # generate time-suffix
+        time_suffix = datetime.now().strftime("%Y%m%d_%H%M")
+        return f"{self.log_dir}/{self.name}_{time_suffix}"
+
+    def get_save_dir(self):
+        return f"{self.save_dir}/{self.name}"

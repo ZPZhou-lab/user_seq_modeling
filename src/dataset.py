@@ -19,12 +19,14 @@ class EventSequenceDataLoaderMeta:
         config: TrainingConfig, 
         rank: int = 0,
         prefix_prompt: str = '',
+        split: str = 'train'
     ):
         self.config = config
         self.rank = rank
         self.world_size     = dist.get_world_size() if dist.is_initialized() else 1
         self.prefix_prompt  = prefix_prompt
-        self.data_dir       = config.data_dir
+        self.split          = split
+        self.data_dir       = config.train_data_dir if split == 'train' else config.valid_data_dir
         self.model_path     = config.model_path
         self.batch_size     = config.batch_size
         self.max_seq_len    = config.max_seq_len
@@ -62,11 +64,15 @@ class EventSequenceDataLoaderMeta:
         # init current shard
         self.current_pos = 0
         self.current_shard_idx = 0
-        self.current_shard = torch.load(
-            self.shards[self.current_shard_idx], map_location='cpu', weights_only=True)
+        self.current_shard = self.safe_load()
 
     def __len__(self):
         return self.total_samples
+
+    @property
+    def total_steps(self):
+        """total steps for one epoch iteration"""
+        return self.total_samples // (self.batch_size * self.world_size)
 
     def next_batch(self):
         """get the next batch of data"""
@@ -140,8 +146,7 @@ class EventSequenceDataLoaderMeta:
         """
         self.current_pos = 0
         self.current_shard_idx = 0
-        self.current_shard = torch.load(
-            self.shards[self.current_shard_idx], map_location='cpu', weights_only=True)
+        self.current_shard = self.safe_load()
         
     def get_local_idx(self, global_idx: int):
         """
@@ -157,3 +162,22 @@ class EventSequenceDataLoaderMeta:
         
         local_idx = global_idx - self.cumulative_samples[shard_idx]
         return local_idx
+    
+    def safe_load(self):
+        """
+        safe load the dataset shard
+        """        
+        max_retries = 5
+        for retry in range(max_retries):
+            try:
+                return torch.load(
+                    self.shards[self.current_shard_idx], map_location='cpu', weights_only=True)
+            except (AssertionError, Exception) as e:
+                if retry < max_retries - 1:
+                    logger.warning(f"Error loading shard {self.shards[self.current_shard_idx]}, retrying {retry+1}/{max_retries}: {str(e)}")
+                    import time
+                    time.sleep(1)  # Add a small delay before retrying
+                else:
+                    logger.error(f"Failed to load shard after {max_retries} attempts: {str(e)}")
+                    # Return empty list as fallback to prevent crash
+                    raise e
