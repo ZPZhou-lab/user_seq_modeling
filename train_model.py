@@ -2,7 +2,7 @@ import os
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from src.arguments import TrainingConfig, ModelPath
+from src.arguments import TrainingConfig, TimeEmbeddingConfig, ModelPath
 from src.user_encoder import UserEncoder
 from src.v1 import TextEventSequencePairDataLoader
 from src.v1 import EventEncoder
@@ -11,6 +11,15 @@ from src.train import (
     LearningRateScheduler,
     TensorboardLogger,
     train_step, valid_context
+)
+
+ts_config = TimeEmbeddingConfig(
+    use_time_embedding=True,
+    mode='absolute',
+    time_hiddens=256,
+    max_diff_day=720,
+    max_year_ago=10,
+    mixup_activation='silu'
 )
 
 config = TrainingConfig(
@@ -27,7 +36,8 @@ config = TrainingConfig(
     log_dir='./logs',
     save_dir='./ckpt',
     learning_rate=1e-5,
-    warm_up_steps=100,
+    top_warmup_steps=-1,
+    warmup_steps=100,
     max_steps=10000,
     log_freq=1,
     eval_steps=10,
@@ -65,8 +75,8 @@ if __name__ == '__main__':
     ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = worker_setup(ddp, 42)
 
     # build data loader
-    train_loader = TextEventSequencePairDataLoader(config, rank=0)
-    valid_loader = TextEventSequencePairDataLoader(config, rank=0, split='valid')
+    train_loader = TextEventSequencePairDataLoader(config, rank=0, ts_config=ts_config, split='train')
+    valid_loader = TextEventSequencePairDataLoader(config, rank=0, ts_config=ts_config, split='valid')
 
     # build event encoder
     event_encoder = EventEncoder(
@@ -75,7 +85,10 @@ if __name__ == '__main__':
         use_flat_flash_attention=True
     )
     # build user encoder
-    user_encoder = UserEncoder(model_path=config.model_path)
+    user_encoder = UserEncoder(
+        model_path=config.model_path,
+        ts_config=ts_config
+    )
     model = HierarchicalModel(
         event_encoder=event_encoder,
         user_encoder=user_encoder,
@@ -92,12 +105,14 @@ if __name__ == '__main__':
     else:
         raw_model = model
     
-    optimizer = raw_model.build_optimizer(
-        learning_rate=config.learning_rate)
+    optimizer = raw_model.build_optimizer(learning_rate=config.learning_rate)
     lr_scheduler = LearningRateScheduler(
-        lr=config.learning_rate, 
-        warm_up_steps=config.warm_up_steps,
-        max_steps=config.max_steps
+        optimizer=optimizer,
+        warmup_steps=config.warmup_steps,
+        max_steps=config.max_steps,
+        top_warmup_steps=config.top_warmup_steps,
+        learning_rate=config.learning_rate, 
+        lower_pct=0.1
     )
     
 
@@ -109,7 +124,7 @@ if __name__ == '__main__':
         tb_logger = None
 
     # begin training
-    max_steps = 20
+    max_steps = 10
     for step in range(max_steps):
         # train step
         train_step(model, train_loader, optimizer, lr_scheduler, step + 1, ddp, 

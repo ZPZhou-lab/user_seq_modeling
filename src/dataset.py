@@ -4,11 +4,13 @@ from transformers import AutoTokenizer
 import torch.distributed as dist
 import math
 import random
-from src.arguments import TrainingConfig
+from src.arguments import TrainingConfig, TimeEmbeddingConfig
 from typing import List
 from abc import abstractmethod
+from datetime import datetime
 import logging
 logger = logging.getLogger('Dataset')
+
 
 
 class EventSequenceDataLoaderMeta:
@@ -17,11 +19,13 @@ class EventSequenceDataLoaderMeta:
     """
     def __init__(self, 
         config: TrainingConfig, 
+        ts_config: TimeEmbeddingConfig,
         rank: int = 0,
         prefix_prompt: str = '',
-        split: str = 'train'
+        split: str = 'train',
     ):
         self.config = config
+        self.ts_config = ts_config
         self.rank = rank
         self.world_size     = dist.get_world_size() if dist.is_initialized() else 1
         self.prefix_prompt  = prefix_prompt
@@ -56,7 +60,7 @@ class EventSequenceDataLoaderMeta:
         # create shard info
         self.shard_samples, self.cumulative_samples = [], [0]
         for shard in self.shards:
-            samples = torch.load(shard, map_location='cpu', weights_only=True)
+            samples = self.safe_load(shard)
             self.shard_samples.append(len(samples))
             self.cumulative_samples.append(self.cumulative_samples[-1] + len(samples))
         self.total_samples = self.cumulative_samples[-1]
@@ -64,7 +68,7 @@ class EventSequenceDataLoaderMeta:
         # init current shard
         self.current_pos = 0
         self.current_shard_idx = 0
-        self.current_shard = self.safe_load()
+        self.current_shard = self.safe_load(self.shards[self.current_shard_idx])
 
     def __len__(self):
         return self.total_samples
@@ -146,7 +150,7 @@ class EventSequenceDataLoaderMeta:
         """
         self.current_pos = 0
         self.current_shard_idx = 0
-        self.current_shard = self.safe_load()
+        self.current_shard = self.safe_load(self.shards[self.current_shard_idx])
         
     def get_local_idx(self, global_idx: int):
         """
@@ -163,15 +167,14 @@ class EventSequenceDataLoaderMeta:
         local_idx = global_idx - self.cumulative_samples[shard_idx]
         return local_idx
     
-    def safe_load(self):
+    def safe_load(self, path: str):
         """
         safe load the dataset shard
         """        
         max_retries = 5
         for retry in range(max_retries):
             try:
-                return torch.load(
-                    self.shards[self.current_shard_idx], map_location='cpu', weights_only=True)
+                return torch.load(path, map_location='cpu', weights_only=True)
             except (AssertionError, Exception) as e:
                 if retry < max_retries - 1:
                     logger.warning(f"Error loading shard {self.shards[self.current_shard_idx]}, retrying {retry+1}/{max_retries}: {str(e)}")
@@ -181,3 +184,57 @@ class EventSequenceDataLoaderMeta:
                     logger.error(f"Failed to load shard after {max_retries} attempts: {str(e)}")
                     # Return empty list as fallback to prevent crash
                     raise e
+
+
+def get_action_time_diff(
+    action_time: str, 
+    observe_time: str,
+    mode: str='relative',
+    max_diff_day: int=720,
+    max_year_ago: int=10
+):
+    """
+    locate the `action_time` as diff from `observe_time`.
+
+    Parameters
+    ----------
+    action_time: str
+        the time when the action happened.
+    observe_time: str
+        the time when do the observation.
+    mode: str
+        the mode of time diff, one of `relative`, `absolute`, default is `relative`.\n
+        - `relative`: locate the time as diff in tuple `(days, hours, minutes and seconds)`.\n
+        - `absolute`: locate the time as tuple `(-year, month, day, hour, minute, second)`.\n
+    max_diff_day: int
+        the max diff day, default is 720 days, time_diff > 720 days will be truncated to 720 days,\
+        only used when mode is `relative`
+    max_year_age: int
+        the max year age, default is 10 years, year > 10 years will be truncated to 10 years,\
+        only used when mode is `absolute`
+    """
+    # calculate the date diff from now
+    # get the day, hour, minute, second diff
+    obs_time = datetime.strptime(observe_time, '%Y-%m-%d %H:%M:%S')
+    act_time = datetime.strptime(action_time, '%Y-%m-%d %H:%M:%S')
+    diff = obs_time - act_time
+    # Extract total days
+    day_diff = diff.days
+
+    if mode == 'relative':
+        if day_diff >= max_diff_day:
+            return (max_diff_day - 1, 23, 59, 59)
+        # Calculate remaining seconds
+        remainder = diff.seconds
+        # Extract hours, minutes, seconds
+        hour_diff = remainder // 3600
+        remainder = remainder % 3600
+        minute_diff = remainder // 60
+        second_diff = remainder % 60
+        return (day_diff, hour_diff, minute_diff, second_diff)
+    elif mode == 'absolute':
+        year = max(obs_time.year - act_time.year, 0)
+        year = min(year, max_year_ago)
+        return (year, act_time.month, act_time.day, act_time.hour, act_time.minute, act_time.second)
+    else:
+        raise ValueError(f"Invalid mode: {mode}. Must be 'relative' or 'absolute'.")

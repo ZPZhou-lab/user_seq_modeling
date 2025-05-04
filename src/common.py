@@ -40,7 +40,8 @@ def build_activation_function(activation: str):
         'gelu': nn.GELU(),
         'tanh': nn.Tanh(),
         'sigmoid': nn.Sigmoid(),
-        'swish': nn.SiLU()
+        'swish': nn.SiLU(),
+        'silu': nn.SiLU()
     }
     if activation not in ACTIVATIONS:
         raise ValueError(f"Unsupported activation function: {activation}")
@@ -52,7 +53,8 @@ class ClassificationHead(nn.Module):
         num_hiddens: int,
         num_classes: int,
         dropout: float=0.0,
-        activation: str='relu'
+        activation: str='relu',
+        **kwargs
     ):
         super(ClassificationHead, self).__init__()
         self.num_hiddens = num_hiddens
@@ -64,17 +66,96 @@ class ClassificationHead(nn.Module):
         self.proj_out = nn.Linear(num_hiddens, num_classes)
         self.dropout_layer = nn.Dropout(dropout)
         self.activation = build_activation_function(activation)
+        # init weights
+        self._init_std = kwargs.get('init_std', 0.02)
+        self._init_bias = kwargs.get('init_bias', 0.0)
+        self.apply(self._init_weights)
         
     def forward(self, x):
         return self.proj_out(self.dropout_layer(self.activation(self.proj_in(x))))
 
-    def init_weights(self):
+    def _init_weights(self, module: nn.Module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(0.0, self._init_std)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, self._init_bias)
+
+
+class TimeStampEmbedding(nn.Module):
+    def __init__(self,
+        num_hiddens: int, 
+        mode: str='absolute', 
+        time_hiddens: int=512,
+        max_diff_day: int=720,
+        max_year_age: int=10,
+        mixup_activation: str='silu',
+        **kwargs
+    ):
+        super().__init__()
+        # mode control the precision of time 
+        # mode `absolute` need tuple with `(year, month, day, hour, minute, second)`
+        # mode `relative` need tuple with `(days, hours, minutes and seconds)`
+        self.mode = mode
+        self.num_hiddens = num_hiddens
+        self.time_hiddens = time_hiddens
+        self.max_diff_day = max_diff_day
+        self.max_year_age = max_year_age
+        self.mixup_activation = mixup_activation
+
+        # build the embedding layer
+        if self.mode == 'absolute':
+            self.embed_time = nn.ModuleList([nn.Embedding(x, time_hiddens) for x in [max_year_age, 13, 32, 24, 60, 60]])
+            self.num_time_loc = 6
+        else:
+            self.embed_time = nn.ModuleList([nn.Embedding(x, time_hiddens) for x in [max_diff_day, 24, 60, 60]])
+            self.num_time_loc = 4
+        
+        # use a MLP to mix the time embeddings into hidden states
+        self.time_mixup = nn.Sequential(
+            nn.Linear(self.num_time_loc * time_hiddens, num_hiddens),
+            build_activation_function(mixup_activation),
+            nn.Linear(num_hiddens, num_hiddens)
+        )
         # init weights
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        self._init_std = kwargs.get('init_std', 0.02)
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module: nn.Module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(0.0, self._init_std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(0.0, self._init_std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+    
+    def forward(self, timestamps: torch.Tensor):
+        """
+        forward timestamp to time embedding
+
+        Parameters
+        ----------
+        timestamps: torch.Tensor
+            the timestamps of each event, with shape `(batch, seq_len, num_time_loc)` or `(seq_len, num_time_loc)`.
+        """
+        # get the shape and check the input
+        orig_shape = timestamps.shape
+        T = timestamps.size(2) if timestamps.ndim == 3 else timestamps.size(1)
+        assert T == self.num_time_loc, f"the input shape {timestamps.shape} is not match the time loc {self.num_time_loc}"
+        # reshape to 2D tensor
+        if timestamps.ndim == 3:
+            timestamps = timestamps.view(-1, T)
+
+        # (N, T) -> (T, N, hiddens) -> (N, T * hiddens)
+        embeddings = [
+            self.embed_time[i](timestamps[..., i]) for i in range(self.num_time_loc)
+        ]
+        embeddings = torch.cat(embeddings, dim=-1)
+        # (N, T * hiddens) -> (N, hiddens)
+        embeddings = self.time_mixup(embeddings)
+        return embeddings.view(*orig_shape[:-1], -1)
 
 
 class Accumulator:

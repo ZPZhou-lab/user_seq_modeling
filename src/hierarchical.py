@@ -42,14 +42,14 @@ class HierarchicalModel(nn.Module):
         )
         # add classifier head
         if num_classes is not None:
-            self.classfier = ClassificationHead(
+            self.classifier = ClassificationHead(
                 num_hiddens=self.user_encoder.llm.config.hidden_size, 
                 num_classes=num_classes,
                 activation='relu'
             )
-            self.classfier.to(self.device)
+            self.classifier.to(self.device)
         else:
-            self.classfier = None
+            self.classifier = None
 
 
     def forward(self,
@@ -57,6 +57,7 @@ class HierarchicalModel(nn.Module):
         pos_position_ids: torch.Tensor,
         pos_varlen: torch.Tensor,
         attention_mask: torch.Tensor,
+        time_ids: torch.Tensor=None,
         neg_input_ids: torch.Tensor=None,
         neg_position_ids: torch.Tensor=None,
         neg_varlen: torch.Tensor=None,
@@ -77,6 +78,8 @@ class HierarchicalModel(nn.Module):
             The variable length of the positive event sequence.
         attention_mask: (batch, seq_len)
             The attention mask for the inputs to UserEncoder.
+        time_ids: (batch, seq_len, num_time_loc)
+            The time ids for the inputs to UserEncoder.
         neg_input_ids: (num_neg, )
             The input ids for the negative event sequence.
         neg_position_ids: (seq_len, )
@@ -101,22 +104,23 @@ class HierarchicalModel(nn.Module):
         predictions, user_embedding = self.user_encoder(
             event_embeddings=pos_hidden_states,
             attention_mask=attention_mask,
+            time_ids=time_ids,
             add_user_token=add_user_token
         )
    
         # add classifier head
-        if self.classfier is not None:
-            logits = self.classfier(user_embedding)
+        if self.classifier is not None:
+            logits = self.classifier(user_embedding)
         else:
             logits = None
         
         if logits is not None and labels is not None:
-            if self.classfier.num_classes == 1:
+            if self.classifier.num_classes == 1:
                 ce_loss = F.binary_cross_entropy_with_logits(
                     logits.view(-1), labels.view(-1).float())
             else:
                 ce_loss = F.cross_entropy(
-                    logits.view(-1, self.classfier.num_classes), labels.view(-1).long())
+                    logits.view(-1, self.classifier.num_classes), labels.view(-1).long())
         else:
             ce_loss = 0.0
 
@@ -160,48 +164,38 @@ class HierarchicalModel(nn.Module):
         """
         build optimizer
         """
-        # optimizer_grouped_parameters = [
-        #     {
-        #         'params': [p for n, p in self.user_encoder.named_parameters() if p.ndim >= 2],
-        #         'weight_decay': weight_decay
-        #     },
-        #     {
-        #         'params': [p for n, p in self.user_encoder.named_parameters() if p.ndim < 2],
-        #         'weight_decay': 0.0
-        #     },
-        #     {
-        #         'params': [p for n, p in self.event_encoder.named_parameters() if p.ndim >= 2],
-        #         'weight_decay': weight_decay
-        #     },
-        #     {
-        #         'params': [p for n, p in self.event_encoder.named_parameters() if p.ndim < 2],
-        #         'weight_decay': 0.0
-        #     },
-        #     {
-        #         'params': [p for n, p in self.classfier.named_parameters() if p.ndim >= 2],
-        #         'weight_decay': weight_decay
-        #     },
-        #     {
-        #         'params': [p for n, p in self.classfier.named_parameters() if p.ndim < 2],
-        #         'weight_decay': 0.0
-        #     }
-        # ]
-        grouped_parameters = [
-            {
-                'params': [p for n, p in self.named_parameters() if p.ndim >= 2],
-                'weight_decay': weight_decay
-            },
-            {
-                'params': [p for n, p in self.named_parameters() if p.ndim < 2],
-                'weight_decay': 0.0
-            }
-        ]
-
-        print(f"Totol parameters use weight-decay: {sum([p.numel() for p in grouped_parameters[0]['params']])}")
-        print(f"Totol parameters not use weight-decay: {sum([p.numel() for p in grouped_parameters[1]['params']])}")
-        
-        return torch.optim.AdamW(grouped_parameters, lr=learning_rate, eps=adam_epsilon)
+        param_groups = self.build_param_groups(weight_decay=weight_decay)
+        return torch.optim.AdamW(param_groups, lr=learning_rate, eps=adam_epsilon)
     
+    def build_param_groups(self, weight_decay: float = 0.01):
+        encoder_with_wd, encoder_without_wd = [], []
+        classifier_with_wd, classifier_without_wd = [], []
+
+        for name, param in self.named_parameters():
+            if 'classifier' in name:
+                if param.ndim >= 2:
+                    classifier_with_wd.append(param)
+                else:
+                    classifier_without_wd.append(param)
+            else:
+                if param.ndim >= 2:
+                    encoder_with_wd.append(param)
+                else:
+                    encoder_without_wd.append(param)
+
+        grouped_parameters = [
+            {'name': 'encoder.with_wd',      'params': encoder_with_wd,      'weight_decay': weight_decay},
+            {'name': 'encoder.without_wd',   'params': encoder_without_wd,   'weight_decay': 0.0},
+            {'name': 'classifier.with_wd',   'params': classifier_with_wd,   'weight_decay': weight_decay},
+            {'name': 'classifier.without_wd','params': classifier_without_wd,'weight_decay': 0.0}
+        ]
+        print(f"Prams of encoder    use weight-decay: {sum([p.numel() for p in encoder_with_wd])}")
+        print(f"Prams of encoder    not use weight-decay: {sum([p.numel() for p in encoder_without_wd])}")
+        print(f"Prams of classifier use weight-decay: {sum([p.numel() for p in classifier_with_wd])}")
+        print(f"Prams of classifier not use weight-decay: {sum([p.numel() for p in classifier_without_wd])}")
+
+        return grouped_parameters
+
 
     def save_pretrained(self, save_path: str):
         """
@@ -209,14 +203,14 @@ class HierarchicalModel(nn.Module):
         """
         self.event_encoder.save_pretrained(os.path.join(save_path, "event_encoder"))
         self.user_encoder.save_pretrained(os.path.join(save_path, "user_encoder"))
-        if self.classfier is not None:
-            torch.save(self.classfier.state_dict(), os.path.join(save_path, "classifier.pt"))
+        if self.classifier is not None:
+            torch.save(self.classifier.state_dict(), os.path.join(save_path, "classifier.pt"))
         # generate config.json
         config = {
             "model_type": "HierarchicalModel",
             "temperature": self.nce_loss_func.temperature.item(),
             "nce_threshold": self.nce_loss_func.nce_threshold,
-            "num_classes": self.classfier.num_classes if self.classfier is not None else None
+            "num_classes": self.classifier.num_classes if self.classifier is not None else None
         }
         torch.save(config, os.path.join(save_path, "config.json"))
     
@@ -227,8 +221,8 @@ class HierarchicalModel(nn.Module):
         """
         self.event_encoder.from_pretrained(os.path.join(model_path, "event_encoder"))
         self.user_encoder.from_pretrained(os.path.join(model_path, "user_encoder"))
-        if self.classfier is not None:
-            self.classfier.load_state_dict(torch.load(os.path.join(model_path, "model.pt")))
+        if self.classifier is not None:
+            self.classifier.load_state_dict(torch.load(os.path.join(model_path, "model.pt")))
         # load config.json
         config = torch.load(os.path.join(model_path, "config.json"))
         self.nce_loss_func.temperature.data = torch.tensor(config["temperature"])

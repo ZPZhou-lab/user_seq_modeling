@@ -1,6 +1,6 @@
-from curses import raw
 import os
 import torch
+from torch.optim import Optimizer
 import time
 import math
 from .common import ScalerAccumulator, TensorAccumulator
@@ -8,29 +8,80 @@ from .dataset import EventSequenceDataLoaderMeta
 from .hierarchical import HierarchicalModel, HierarchicalModelOutput
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import roc_auc_score
+from typing import Dict
 
 # cos-decay with warm-up learning rate scheduler
 class LearningRateScheduler:
-    def __init__(self, lr: float, warm_up_steps: int, max_steps: int, **kwargs):
-        self.lr = lr
-        self.warm_up_steps = warm_up_steps
-        self.max_steps = max_steps
-        self.lowert_pct = 0.1
-        self.min_lr = self.lowert_pct * self.lr
-
-    def __call__(self, step: int):
-        """
-        step: int
-            The training step, starting from 0
-        """
-        if step < self.warm_up_steps:
-            return (step + 1) / (self.warm_up_steps) * self.lr
-        elif step > self.max_steps:
-            return self.min_lr
-        # cos-decay 
+    def __init__(self, 
+        optimizer: Optimizer,
+        warmup_steps: int=100, 
+        max_steps: int=10000,
+        top_warmup_steps: int=-1,
+        learning_rate: float=1e-5, 
+        lower_pct: float=0.1
+    ):
+        self.optimizer          = optimizer
+        self.warmup_steps       = warmup_steps
+        self.max_steps          = max_steps
+        self.top_warmup_steps   = top_warmup_steps
+        self.max_lr             = learning_rate
+        self.min_lr             = lower_pct * learning_rate
+        self.current_step       = 0
+        self._local_step        = 0
+        self._top_warmup_flag   = True if top_warmup_steps > 0 else False
+        
+        # save the original parameter groups
+        self.orig_param_groups = []
+        for group in optimizer.param_groups:
+            self.orig_param_groups.append({
+                'params': group['params'], 
+                'lr': group.get('lr', learning_rate),
+                'weight_decay': group.get('weight_decay', 0.0)})
+    
+    def step(self):
+        """update the learning rate for each step"""
+        self.current_step += 1
+        
+        # stap 1: warmup for head classifier
+        if self._top_warmup_flag:
+            self._local_step += 1
+            lr_scale = min(1.0, self._local_step / self.top_warmup_steps)
+            current_lr = self.min_lr + (self.max_lr - self.min_lr) * lr_scale
+            
+            # update the optimizer parameter groups
+            for param_group in self.optimizer.param_groups:
+                name = param_group['name'].split('.')[0]
+                if name == 'classifier':
+                    param_group['lr'] = current_lr
+                else:
+                    param_group['lr'] = 0.0
+            # check if the current step is the last step of warmup
+            # if so, reset step so as to start the next stage
+            if self.current_step == self.top_warmup_steps:
+                self._top_warmup_flag = False
+                self._local_step = 0
         else:
-            coeff = 1.0 + math.cos(math.pi * (step - self.warm_up_steps) / (self.max_steps - self.warm_up_steps))
-            return self.min_lr + 0.5 * coeff * (self.lr - self.min_lr)
+            self._local_step += 1
+            # step 2: cos-decay with warmup for all parameters
+            if self._local_step < self.warmup_steps:
+                current_lr = self._local_step / self.warmup_steps * self.max_lr
+            elif self._local_step > self.max_steps:
+                current_lr = self.min_lr
+            else:
+                coeff = 1.0 + math.cos(math.pi * (self._local_step - self.warmup_steps) / (self.max_steps - self.warmup_steps))
+                current_lr = self.min_lr + 0.5 * coeff * (self.max_lr - self.min_lr)
+            
+            # update the optimizer parameter groups
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+    
+    def get_lr(self) -> Dict[str, float]:
+        """Get the current learning rate for each parameter group"""
+        group_lr = {}
+        for param_group in self.optimizer.param_groups:
+            name = param_group['name'].split('.')[0]
+            group_lr[name] = param_group['lr']
+        return group_lr
 
 
 class TensorboardLogger:
@@ -46,7 +97,10 @@ class TensorboardLogger:
             step (int): Current training step
         """
         for key, value in metrics.items():
-            self.writer.add_scalar(f"{prefix}/{key}", value, step)
+            if isinstance(value, dict):
+                self.writer.add_scalars(f"{prefix}/{key}", value, step)
+            else:
+                self.writer.add_scalar(f"{prefix}/{key}", value, step)
     
     def close(self):
         self.writer.close()
@@ -63,7 +117,7 @@ def train_step(
     model: HierarchicalModel,
     train_loader: EventSequenceDataLoaderMeta,
     optimizer,
-    lr_scheduler,
+    lr_scheduler: LearningRateScheduler,
     step: int,
     ddp: bool=False,
     nce_loss_lambda: float=0.5,
@@ -105,9 +159,7 @@ def train_step(
     # gradient clipping
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # set learning rate
-    lr = lr_scheduler(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    lr_scheduler.step()
 
     optimizer.step()
     torch.cuda.synchronize()
@@ -120,7 +172,7 @@ def train_step(
             **loss_dict,
             "time_per_iter": time_used,
             "grad_norm": norm.item() if isinstance(norm, torch.Tensor) else norm,
-            "learning_rate": lr
+            "learning_rate": lr_scheduler.get_lr()
         }
         
         # Log to tensorboard at specified frequency

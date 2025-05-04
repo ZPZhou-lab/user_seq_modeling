@@ -1,5 +1,4 @@
 # arguments.py
-
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime
@@ -11,6 +10,17 @@ class ModelPath(Enum):
     Qwen3_1B: str = '../../models/Qwen3-0.6B-Base/'
     Qwen3_2B: str = '../../models/Qwen3-1.7B-Base/'
     TinyLlama_1B: str = '../../models/TinyLlama-1.1B-3T/'
+
+
+@dataclass
+class TimeEmbeddingConfig:
+    use_time_embedding: bool = True
+    mode: str = 'absolute'
+    time_hiddens: int = 256
+    max_diff_day: int = 720
+    max_year_ago: int = 10
+    mixup_activation: str = 'silu'
+
 
 @dataclass
 class TrainingConfig:
@@ -27,7 +37,8 @@ class TrainingConfig:
     log_dir: str = './logs'
     save_dir: str = './checkpoints'
     learning_rate: float = 1e-5
-    warm_up_steps: int  = 100
+    warmup_steps: int   = 100
+    top_warmup_steps: int = -1
     max_steps: int      = 10000
     log_freq: int       = 100
     eval_steps: int     = 100
