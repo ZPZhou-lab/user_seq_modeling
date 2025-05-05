@@ -1,12 +1,11 @@
 # dataset.py
 import torch
 from typing import List
-from .dataset import EventSequenceDataLoaderMeta, get_action_time_diff
-
-
-def format_event(event_list: List[str]):
-    action_time, event = event_list
-    return action_time, event
+from .dataset import (
+    EventSequenceDataLoaderMeta, 
+    get_action_time_diff,
+    format_event
+)
 
 
 class TextEventSequencePairDataLoader(EventSequenceDataLoaderMeta):

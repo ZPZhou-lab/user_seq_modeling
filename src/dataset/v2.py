@@ -5,6 +5,7 @@ from typing import List
 from .dataset import (
     EventSequenceDataLoaderMeta, 
     get_action_time_diff, 
+    format_event,
     logger
 )
 from datasets import Dataset

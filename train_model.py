@@ -3,8 +3,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from src.arguments import TrainingConfig, TimeEmbeddingConfig, ModelPath
-from src.user_encoder import UserEncoder
-from src.event_encoder import EventEncoder
+from src.encoder_user import UserEncoder
+from src.encoder_event import EventEncoder
 from src.hierarchical import HierarchicalModel
 from src.dataset import TextEventSequencePairDataLoaderV2 as TextEventSequencePairDataLoader
 from src.train import (

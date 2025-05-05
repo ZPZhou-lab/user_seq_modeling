@@ -11,6 +11,9 @@ from datetime import datetime
 import logging
 logger = logging.getLogger('Dataset')
 
+def format_event(event_list: List[str]):
+    action_time, event = event_list
+    return action_time, event
 
 class EventSequenceDataLoaderMeta:
     """

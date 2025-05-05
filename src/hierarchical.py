@@ -5,8 +5,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from dataclasses import dataclass
 from .common import all_gather, create_device_info, ClassificationHead
-from .user_encoder import UserEncoder
-from .event_encoder import EventEncoder
+from .encoder_user import UserEncoder
+from .encoder_event import EventEncoder
 import os
 
 
