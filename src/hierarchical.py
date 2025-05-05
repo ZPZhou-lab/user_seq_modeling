@@ -6,6 +6,7 @@ import torch.distributed as dist
 from dataclasses import dataclass
 from .common import all_gather, create_device_info, ClassificationHead
 from .user_encoder import UserEncoder
+from .event_encoder import EventEncoder
 import os
 
 
@@ -21,7 +22,7 @@ class HierarchicalModelOutput:
 
 class HierarchicalModel(nn.Module):
     def __init__(self,
-        event_encoder: nn.Module,
+        event_encoder: EventEncoder,
         user_encoder: UserEncoder,
         temperature: float = 0.05,
         nce_threshold: float = 0.99,

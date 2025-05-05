@@ -2,9 +2,9 @@ import torch
 import torch.distributed as dist
 from src.arguments import TrainingConfig, ModelPath
 from src.user_encoder import UserEncoder
-from src.v1 import TextEventSequencePairDataLoader
-from src.v1 import EventEncoder
+from src.event_encoder import EventEncoder
 from src.hierarchical import HierarchicalModel, HierarchicalModelOutput
+from src.dataset import TextEventSequencePairDataLoaderV2 as TextEventSequencePairDataLoader
 from src.train import (
     TensorboardLogger,
     eval_performance

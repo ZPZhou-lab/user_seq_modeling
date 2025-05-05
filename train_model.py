@@ -4,9 +4,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from src.arguments import TrainingConfig, TimeEmbeddingConfig, ModelPath
 from src.user_encoder import UserEncoder
-from src.v1 import TextEventSequencePairDataLoader
-from src.v1 import EventEncoder
+from src.event_encoder import EventEncoder
 from src.hierarchical import HierarchicalModel
+from src.dataset import TextEventSequencePairDataLoaderV2 as TextEventSequencePairDataLoader
 from src.train import (
     LearningRateScheduler,
     TensorboardLogger,

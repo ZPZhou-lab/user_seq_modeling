@@ -12,7 +12,6 @@ import logging
 logger = logging.getLogger('Dataset')
 
 
-
 class EventSequenceDataLoaderMeta:
     """
     sample text event sequence pair-wise dataset for training
@@ -68,7 +67,7 @@ class EventSequenceDataLoaderMeta:
         # init current shard
         self.current_pos = 0
         self.current_shard_idx = 0
-        self.current_shard = self.safe_load(self.shards[self.current_shard_idx])
+        self.current_shard = self.safe_load()
 
     def __len__(self):
         return self.total_samples
@@ -85,6 +84,8 @@ class EventSequenceDataLoaderMeta:
         if end > self.total_samples:
             # reset current pos
             self.current_pos = 0
+            self.current_shard_idx = 0
+            self.current_shard = self.safe_load()
             return self.next_batch()
 
         # get the global_idx in current batch
@@ -150,7 +151,7 @@ class EventSequenceDataLoaderMeta:
         """
         self.current_pos = 0
         self.current_shard_idx = 0
-        self.current_shard = self.safe_load(self.shards[self.current_shard_idx])
+        self.current_shard = self.safe_load()
         
     def get_local_idx(self, global_idx: int):
         """
@@ -161,23 +162,25 @@ class EventSequenceDataLoaderMeta:
         ) - 1
         if shard_idx != self.current_shard_idx:
             self.current_shard_idx = shard_idx
-            self.current_shard = torch.load(
-                self.shards[self.current_shard_idx], map_location='cpu', weights_only=True)
+            self.current_shard = self.safe_load()
         
         local_idx = global_idx - self.cumulative_samples[shard_idx]
         return local_idx
     
-    def safe_load(self, path: str):
+    def safe_load(self, path: str=None):
         """
         safe load the dataset shard
-        """        
+        """
+        if path is None:
+            path = self.shards[self.current_shard_idx]
+
         max_retries = 5
         for retry in range(max_retries):
             try:
                 return torch.load(path, map_location='cpu', weights_only=True)
             except (AssertionError, Exception) as e:
                 if retry < max_retries - 1:
-                    logger.warning(f"Error loading shard {self.shards[self.current_shard_idx]}, retrying {retry+1}/{max_retries}: {str(e)}")
+                    logger.warning(f"Error loading shard {path}, retrying {retry+1}/{max_retries}: {str(e)}")
                     import time
                     time.sleep(1)  # Add a small delay before retrying
                 else:

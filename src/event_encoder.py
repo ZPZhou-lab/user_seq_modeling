@@ -3,8 +3,8 @@ import os
 if sys.platform == "darwin":
     os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 from transformers import AutoTokenizer, AutoConfig
-from .modeling.modeling_llama import LlamaForCausalLM as CustomLlamaForCausalLM
-from .modeling.modeling_qwen3 import Qwen3ForCausalLM as CustomQwen3ForCausalLM
+from .modeling import LlamaForCausalLM as CustomLlamaForCausalLM
+from .modeling import Qwen3ForCausalLM as CustomQwen3ForCausalLM
 import torch
 from torch import nn
 from typing import Any
