@@ -1,5 +1,6 @@
 import random
 import torch
+import pandas as pd
 from datetime import datetime, timedelta
 
 # generate fake data
@@ -44,4 +45,5 @@ if __name__ == '__main__':
         shard = []
         for _ in range(1000):
             shard.append(generate_event_seq(max_seq_len=30))
+        shard = pd.DataFrame(shard)
         torch.save(shard, f"data/shard_{i:06d}.pkl")

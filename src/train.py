@@ -3,6 +3,7 @@ import torch
 from torch.optim import Optimizer
 import time
 import math
+from .arguments import TrainingConfig
 from .common import ScalerAccumulator, TensorAccumulator
 from .dataset import EventSequenceDataLoaderMeta
 from .hierarchical import HierarchicalModel, HierarchicalModelOutput
@@ -13,30 +14,27 @@ from typing import Dict
 # cos-decay with warm-up learning rate scheduler
 class LearningRateScheduler:
     def __init__(self, 
+        config: TrainingConfig,
         optimizer: Optimizer,
-        warmup_steps: int=100, 
-        max_steps: int=10000,
-        top_warmup_steps: int=-1,
-        learning_rate: float=1e-5, 
         lower_pct: float=0.1
     ):
         self.optimizer          = optimizer
-        self.warmup_steps       = warmup_steps
-        self.max_steps          = max_steps
-        self.top_warmup_steps   = top_warmup_steps
-        self.max_lr             = learning_rate
-        self.min_lr             = lower_pct * learning_rate
+        self.warmup_steps       = config.warmup_steps
+        self.max_steps          = config.max_steps
+        self.top_warmup_steps   = config.top_warmup_steps
+        self.max_lr             = config.learning_rate
+        self.min_lr             = lower_pct * config.learning_rate
         self.current_step       = 0
         self._local_step        = 0
-        self._top_warmup_flag   = True if top_warmup_steps > 0 else False
+        self._top_warmup_flag   = True if config.top_warmup_steps > 0 else False
         
         # save the original parameter groups
         self.orig_param_groups = []
         for group in optimizer.param_groups:
             self.orig_param_groups.append({
                 'params': group['params'], 
-                'lr': group.get('lr', learning_rate),
-                'weight_decay': group.get('weight_decay', 0.0)})
+                'lr': group.get('lr', config.learning_rate),
+                'weight_decay': group.get('weight_decay', config.weight_decay)})
     
     def step(self):
         """update the learning rate for each step"""
@@ -114,14 +112,13 @@ class TensorboardLogger:
 
 
 def train_step(
+    config: TrainingConfig,
     model: HierarchicalModel,
     train_loader: EventSequenceDataLoaderMeta,
-    optimizer,
+    optimizer: Optimizer,
     lr_scheduler: LearningRateScheduler,
     step: int,
     ddp: bool=False,
-    nce_loss_lambda: float=0.5,
-    grad_accum_steps: int=1,
     device: str='cuda',
     master_process: bool=False,
     tb_logger: TensorboardLogger = None,
@@ -132,19 +129,19 @@ def train_step(
     loss_tracker = ScalerAccumulator()
     optimizer.zero_grad()
 
-    for micro_step in range(grad_accum_steps):
+    for micro_step in range(config.grad_accum_steps):
         batch = train_loader.next_batch()
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         
         # set gradient sync
-        # model.require_backward_grad_sync = micro_step == grad_accum_steps - 1 \
-        #     if ddp else model.require_backward_grad_sync
+        if ddp:
+            model.require_backward_grad_sync = micro_step == config.grad_accum_steps - 1
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             # call model
             outputs: HierarchicalModelOutput = model(**batch)
         # calculate loss
-        loss = nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
-        loss = loss / grad_accum_steps
+        loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
+        loss = loss / config.grad_accum_steps
         loss_tracker.update(
             nce_loss=outputs.nce_loss, 
             ce_loss=outputs.ce_loss, 
@@ -181,12 +178,12 @@ def train_step(
 
 
 def valid_context(
+    config: TrainingConfig,
     model: HierarchicalModel,
     valid_loader: EventSequenceDataLoaderMeta,
+    optimizer: Optimizer,
     eval_step: int,
     ddp: bool=False,
-    save_dir: str='./ckpt',
-    nce_loss_lambda: float=0.5,
     device: str='cuda',
     master_process: bool=False,
     tb_logger: TensorboardLogger = None
@@ -199,7 +196,7 @@ def valid_context(
 
     valid_loader.reset()
     with torch.no_grad():
-        for step in range(valid_loader.total_steps):
+        for step in range(min(valid_loader.total_steps, config.max_evel_iter)):
             # get the current batch
             batch = valid_loader.next_batch()
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -208,7 +205,7 @@ def valid_context(
                 # call model
                 outputs: HierarchicalModelOutput = model(**batch)
             # calculate loss
-            loss = nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
+            loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
             loss_tracker.update(
                 nce_loss=outputs.nce_loss, 
                 ce_loss=outputs.ce_loss, 
@@ -244,7 +241,9 @@ def valid_context(
 
         # save the checkpoint
         raw_model = model.module if ddp else model
-        raw_model.save_pretrained(save_path=os.path.join(save_dir, f"ckpt-{eval_step:06d}"))
+        raw_model.save_pretrained(save_path=os.path.join(config.get_save_dir(), f"ckpt-{eval_step:06d}"))
+        # save the optimizer state
+        torch.save(optimizer.state_dict(), os.path.join(config.get_save_dir(), f"ckpt-{eval_step:06d}", "optimizer.pt"))
 
 
 def eval_performance(eval_dict):

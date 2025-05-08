@@ -27,6 +27,7 @@ config = TrainingConfig(
     train_data_dir='./data',
     valid_data_dir='./data',
     model_path=ModelPath.Qwen3_1B,
+    shard_size=10,
     batch_size=2,
     max_seq_len=32,
     max_text_len=32,
@@ -38,9 +39,11 @@ config = TrainingConfig(
     learning_rate=1e-5,
     top_warmup_steps=-1,
     warmup_steps=100,
-    max_steps=10000,
+    grad_accum_steps=1,
+    max_steps=10,
     log_freq=1,
     eval_steps=10,
+    max_evel_iter=100,
     temprature=0.05,
     nce_threshold=0.99,
     nce_loss_lambda=0.5
@@ -70,13 +73,13 @@ def worker_setup(ddp: int, seed: int=42):
 
 
 if __name__ == '__main__':
-    ddp = int(os.environ.get('RANK', -1)) != -1
     # setup worker
+    ddp = int(os.environ.get('RANK', -1)) != -1
     ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = worker_setup(ddp, 42)
 
     # build data loader
-    train_loader = TextEventSequencePairDataLoader(config, rank=0, ts_config=ts_config, split='train')
-    valid_loader = TextEventSequencePairDataLoader(config, rank=0, ts_config=ts_config, split='valid')
+    train_loader = TextEventSequencePairDataLoader(config, ts_config, rank=ddp_rank, split='train')
+    valid_loader = TextEventSequencePairDataLoader(config, ts_config, rank=ddp_rank, split='valid')
 
     # build event encoder
     event_encoder = EventEncoder(
@@ -106,14 +109,7 @@ if __name__ == '__main__':
         raw_model = model
     
     optimizer = raw_model.build_optimizer(learning_rate=config.learning_rate)
-    lr_scheduler = LearningRateScheduler(
-        optimizer=optimizer,
-        warmup_steps=config.warmup_steps,
-        max_steps=config.max_steps,
-        top_warmup_steps=config.top_warmup_steps,
-        learning_rate=config.learning_rate, 
-        lower_pct=0.1
-    )
+    lr_scheduler = LearningRateScheduler(config=config, optimizer=optimizer, lower_pct=0.1)
     
 
     if master_process:
@@ -124,19 +120,15 @@ if __name__ == '__main__':
         tb_logger = None
 
     # begin training
-    max_steps = 10
-    for step in range(max_steps):
+    for step in range(config.max_steps):
         # train step
-        train_step(model, train_loader, optimizer, lr_scheduler, step + 1, ddp, 
-                   nce_loss_lambda=config.nce_loss_lambda, 
-                   grad_accum_steps=1, 
+        train_step(config, model, train_loader, optimizer, lr_scheduler, step + 1, ddp, 
                    device=device, 
                    master_process=master_process, 
                    tb_logger=tb_logger)
         # valid step
         if (step + 1) % config.eval_steps == 0:
-            valid_context(model, valid_loader, step + 1, ddp, config.get_save_dir(),
-                          nce_loss_lambda=config.nce_loss_lambda,
+            valid_context(config, model, valid_loader, optimizer, step + 1, ddp,
                           device=device, 
                           master_process=master_process, 
                           tb_logger=tb_logger)

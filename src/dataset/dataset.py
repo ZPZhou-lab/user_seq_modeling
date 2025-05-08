@@ -96,8 +96,7 @@ class EventSequenceDataLoaderMeta:
         self.current_pos += self.batch_size * self.world_size
 
         # get the current batch
-        samples = self._preprocess_samples(buf)
-        return samples
+        return self._preprocess_samples(buf)
 
 
     @abstractmethod

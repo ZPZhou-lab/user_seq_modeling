@@ -27,24 +27,28 @@ class TrainingConfig:
     train_data_dir: str
     valid_data_dir: str
     model_path: ModelPath
-    batch_size: int = 16
-    max_seq_len: int = 64
-    max_text_len: int = 32
-    num_negatives: int = 256
+    shard_size: int     = 10000
+    batch_size: int     = 16
+    max_seq_len: int    = 64
+    max_text_len: int   = 32
+    num_negatives: int  = 256
     EVENT_TOEKN: str = '[EVENT]'
     # training args
     name: str = 'experiment'
     log_dir: str = './logs'
     save_dir: str = './checkpoints'
-    learning_rate: float = 1e-5
-    warmup_steps: int   = 100
-    top_warmup_steps: int = -1
-    max_steps: int      = 10000
-    log_freq: int       = 100
-    eval_steps: int     = 100
-    temprature: float   = 0.05
-    nce_threshold: float = 0.99
-    nce_loss_lambda: float = 0.5
+    learning_rate: float    = 1e-5
+    weight_decay: float     = 0.01
+    warmup_steps: int       = 100
+    top_warmup_steps: int   = -1
+    grad_accum_steps: int   = 1
+    max_steps: int          = 10000
+    log_freq: int           = 100
+    eval_steps: int         = 100
+    max_evel_iter: int      = 1000
+    temprature: float       = 0.05
+    nce_threshold: float    = 0.99
+    nce_loss_lambda: float  = 0.5
 
     def get_log_dir(self):
         # generate time-suffix
