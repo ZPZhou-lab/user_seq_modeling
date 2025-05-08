@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 def generate_event_seq(max_seq_len: int=64):
 
 
-    event_len = random.randint(1, max_seq_len)
+    event_len = random.randint(max_seq_len // 2, max_seq_len)
 
     events = []
     for i in range(event_len):

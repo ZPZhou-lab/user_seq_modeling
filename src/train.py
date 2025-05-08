@@ -1,6 +1,7 @@
 import os
 import torch
 from torch.optim import Optimizer
+from torch.utils.data import DataLoader
 import time
 import math
 from .arguments import TrainingConfig
@@ -114,7 +115,7 @@ class TensorboardLogger:
 def train_step(
     config: TrainingConfig,
     model: HierarchicalModel,
-    train_loader: EventSequenceDataLoaderMeta,
+    train_loader: DataLoader,
     optimizer: Optimizer,
     lr_scheduler: LearningRateScheduler,
     step: int,
@@ -130,7 +131,7 @@ def train_step(
     optimizer.zero_grad()
 
     for micro_step in range(config.grad_accum_steps):
-        batch = train_loader.next_batch()
+        batch = next(train_loader)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         
         # set gradient sync
@@ -180,7 +181,7 @@ def train_step(
 def valid_context(
     config: TrainingConfig,
     model: HierarchicalModel,
-    valid_loader: EventSequenceDataLoaderMeta,
+    valid_loader: DataLoader,
     optimizer: Optimizer,
     eval_step: int,
     ddp: bool=False,
@@ -194,11 +195,11 @@ def valid_context(
     loss_tracker = ScalerAccumulator()
     eval_tracker = TensorAccumulator()
 
-    valid_loader.reset()
+    # valid_loader.reset()
     with torch.no_grad():
-        for step in range(min(valid_loader.total_steps, config.max_evel_iter)):
+        for step in range(min(len(valid_loader), config.max_evel_iter)):
             # get the current batch
-            batch = valid_loader.next_batch()
+            batch = next(valid_loader)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):

@@ -2,6 +2,7 @@ import os
 import torch
 from transformers import AutoTokenizer
 import torch.distributed as dist
+from torch.utils.data import Sampler, DataLoader
 import math
 import random
 from src.arguments import TrainingConfig, TimeEmbeddingConfig
@@ -14,6 +15,22 @@ logger = logging.getLogger('Dataset')
 def format_event(event_list: List[str]):
     action_time, event = event_list
     return action_time, event
+
+
+def _set_world_size_and_rank(obj, world_size: int, rank: int):
+    """
+    Set the world size and rank for distributed training.
+    """
+    if world_size is None:
+        obj.world_size = dist.get_world_size() if dist.is_initialized() else 1
+    else:
+        obj.world_size = world_size
+    
+    if rank is None:
+        obj.rank = dist.get_rank() if dist.is_initialized() else 0
+    else:
+        obj.rank = rank
+
 
 class EventSequenceDataLoaderMeta:
     """
@@ -243,3 +260,66 @@ def get_action_time_diff(
         return (year, act_time.month, act_time.day, act_time.hour, act_time.minute, act_time.second)
     else:
         raise ValueError(f"Invalid mode: {mode}. Must be 'relative' or 'absolute'.")
+
+
+class SequentialDistributedSampler(Sampler):
+    def __init__(self, dataset, world_size: int=None, rank: int=None):
+        self.dataset = dataset
+        _set_world_size_and_rank(self, world_size, rank)
+
+    def __iter__(self):
+        """
+        each node load a shard of data with `shard_size` samples, 
+        there are `num_replicas * shard_size` samples in total at the same time.\n
+        The sampler samples the sequence of indices from the dataset._shards_idx intervals.
+        """
+        indices = []
+        for start, limit in self.dataset._shards_loc:
+            # For each shard assigned to this rank, generate indices within that shard
+            for i in range(limit):
+                indices.append(start + i)
+        return iter(indices)
+
+    def __len__(self):
+        shards = [limit for _, limit in self.dataset._shards_loc]
+        return sum(shards)
+
+
+class EventSequencePairLoaaderWrapper:
+    def __init__(self, dataloader: DataLoader):
+        self.dataloader = dataloader
+        self._iter = iter(dataloader)
+    
+    def __next__(self):
+        try:
+            return next(self._iter)
+        except StopIteration:
+            # reset the iterator if it reaches the end
+            self._iter = iter(self.dataloader)
+            return next(self._iter)
+    
+    def __len__(self):
+        return len(self.dataloader)
+
+
+def build_dataloader(
+    dataset,
+    config: TrainingConfig, 
+    collate_fn: callable,
+    rank: int=0,
+    **kwargs
+):
+    sampler = SequentialDistributedSampler(dataset, rank=rank)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        sampler=sampler,
+        collate_fn=collate_fn,
+        num_workers=kwargs.get('num_workers', 0),
+        pin_memory=kwargs.get('pin_memory', True),
+        multiprocessing_context=kwargs.get('multiprocessing_context', None),
+        persistent_workers=True if kwargs.get('num_workers', 0) > 0 else False,
+        drop_last=True
+    )
+    
+    return EventSequencePairLoaaderWrapper(data_loader)

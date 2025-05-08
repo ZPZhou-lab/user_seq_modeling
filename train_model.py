@@ -6,7 +6,11 @@ from src.arguments import TrainingConfig, TimeEmbeddingConfig, ModelPath
 from src.encoder_user import UserEncoder
 from src.encoder_event import EventEncoder
 from src.hierarchical import HierarchicalModel
-from src.dataset import TextEventSequencePairDataLoaderV2 as TextEventSequencePairDataLoader
+from src.dataset import (
+    TextEventSequencePairDataset, 
+    sequential_event_collate_fn,
+    build_dataloader
+)
 from src.train import (
     LearningRateScheduler,
     TensorboardLogger,
@@ -78,8 +82,10 @@ if __name__ == '__main__':
     ddp_rank, ddp_local_rank, ddp_world_size, device, master_process = worker_setup(ddp, 42)
 
     # build data loader
-    train_loader = TextEventSequencePairDataLoader(config, ts_config, rank=ddp_rank, split='train')
-    valid_loader = TextEventSequencePairDataLoader(config, ts_config, rank=ddp_rank, split='valid')
+    train_set = TextEventSequencePairDataset(config, ts_config, split='train', rank=ddp_rank)
+    valid_set = TextEventSequencePairDataset(config, ts_config, split='valid', rank=ddp_rank)
+    train_loader = build_dataloader(train_set, config, collate_fn=sequential_event_collate_fn, rank=ddp_rank, num_workers=2)
+    valid_loader = build_dataloader(valid_set, config, collate_fn=sequential_event_collate_fn, rank=ddp_rank, num_workers=2)
 
     # build event encoder
     event_encoder = EventEncoder(
