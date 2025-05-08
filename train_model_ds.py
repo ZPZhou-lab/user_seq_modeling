@@ -1,12 +1,17 @@
 import torch
 import torch.distributed as dist
-from src.arguments import TrainingConfig, ModelPath
+from src.arguments import TrainingConfig, TimeEmbeddingConfig, ModelPath
 from src.encoder_user import UserEncoder
 from src.encoder_event import EventEncoder
 from src.hierarchical import HierarchicalModel, HierarchicalModelOutput
-from src.dataset import TextEventSequencePairDataLoaderV2 as TextEventSequencePairDataLoader
+from src.dataset import (
+    TextEventSequencePairDataset, 
+    sequential_event_collate_fn,
+    build_dataloader
+)
 from src.train import (
     TensorboardLogger,
+    LearningRateScheduler,
     eval_performance
 )
 import deepspeed
@@ -19,18 +24,28 @@ from src.common import ScalerAccumulator, TensorAccumulator
 def parse_args():
     parser = argparse.ArgumentParser(description='User Sequence Modeling with DeepSpeed')
     parser.add_argument('--local_rank', type=int, default=-1,
-                       help='local rank passed from distributed launcher')
+                        help='local rank passed from distributed launcher')
     
     # DeepSpeed arguments
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args
 
+ts_config = TimeEmbeddingConfig(
+    use_time_embedding=True,
+    mode='absolute',
+    time_hiddens=256,
+    max_diff_day=720,
+    max_year_ago=10,
+    mixup_activation='silu'
+)
+
 config = TrainingConfig(
     # dataset args
     train_data_dir='./data',
     valid_data_dir='./data',
     model_path=ModelPath.Qwen3_1B,
+    shard_size=10,
     batch_size=2,
     max_seq_len=32,
     max_text_len=32,
@@ -40,14 +55,18 @@ config = TrainingConfig(
     log_dir='./logs',
     save_dir='./ckpt',
     learning_rate=1e-5,
-    warm_up_steps=100,
-    max_steps=10000,
+    top_warmup_steps=20,
+    warmup_steps=100,
+    grad_accum_steps=4,
+    max_steps=50,
     log_freq=1,
-    eval_steps=10,
+    eval_steps=50,
+    max_evel_iter=100,
     temprature=0.05,
     nce_threshold=0.99,
     nce_loss_lambda=0.5
 )
+
 
 def worker_setup(local_rank, seed=42):
     # setup distributed training
@@ -63,39 +82,37 @@ def worker_setup(local_rank, seed=42):
     return local_rank, device, master_process
 
 # training logic for DeepSpeed
-def train_step_ds(model, batch, nce_loss_lambda=0.5):
+def train_step_ds(config: TrainingConfig, model, batch):
     outputs: HierarchicalModelOutput = model(**batch)
-    loss = nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
+    loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
     
     return loss, outputs
 
 # validation logic for DeepSpeed
 def valid_context_ds(
+    config: TrainingConfig,
     model,
     valid_loader,
     eval_step,
-    save_dir='./ckpt',
-    nce_loss_lambda=0.5,
     device='cuda',
     master_process=False,
-    tb_logger=None
+    tb_logger: TensorboardLogger = None
 ):
     model.eval()
     s_time = time.time()
     loss_tracker = ScalerAccumulator()
     eval_tracker = TensorAccumulator()
 
-    valid_loader.reset()
     with torch.no_grad():
-        for step in range(valid_loader.total_steps):
+        for step in range(min(len(valid_loader), config.max_evel_iter)):
             # get batch data
-            batch = valid_loader.next_batch()
+            batch = next(valid_loader)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             # call model
             outputs = model(**batch)
             # calculate loss
-            loss = nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
+            loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
             loss_tracker.update(
                 nce_loss=outputs.nce_loss, 
                 ce_loss=outputs.ce_loss, 
@@ -123,26 +140,30 @@ def valid_context_ds(
         if tb_logger is not None:
             tb_logger.log(metrics, eval_step, prefix="valid")
         # save model checkpoint
-        model.save_checkpoint(save_dir, f"ckpt-{eval_step:06d}")
+        model.save_checkpoint(config.get_save_dir(), f"ckpt-{eval_step:06d}")
 
 
 if __name__ == '__main__':
     args = parse_args()
     local_rank, device, master_process = worker_setup(args.local_rank)
 
-    # create data loader
-    train_loader = TextEventSequencePairDataLoader(config, rank=local_rank)
-    valid_loader = TextEventSequencePairDataLoader(config, rank=local_rank, split='valid')
+    # build data loader
+    train_set = TextEventSequencePairDataset(config, ts_config, split='train', rank=local_rank)
+    valid_set = TextEventSequencePairDataset(config, ts_config, split='valid', rank=local_rank)
+    train_loader = build_dataloader(train_set, config, collate_fn=sequential_event_collate_fn, rank=local_rank, num_workers=2)
+    valid_loader = build_dataloader(valid_set, config, collate_fn=sequential_event_collate_fn, rank=local_rank, num_workers=2)
 
-    # build event encoder and user encoder
+    # build event encoder
     event_encoder = EventEncoder(
         model_path=config.model_path,
         max_seq_len=config.max_seq_len,
         use_flat_flash_attention=True
     )
-    user_encoder = UserEncoder(model_path=config.model_path)
-    
-    # build model
+    # build user encoder
+    user_encoder = UserEncoder(
+        model_path=config.model_path,
+        ts_config=ts_config
+    )
     model = HierarchicalModel(
         event_encoder=event_encoder,
         user_encoder=user_encoder,
@@ -150,15 +171,20 @@ if __name__ == '__main__':
         nce_threshold=config.nce_threshold,
         num_classes=1
     )
+
     # load DeepSpeed configuration
     ds_config = json.load(open('ds_config.json'))
+    ds_config['train_micro_batch_size_per_gpu'] = config.batch_size
+    ds_config['gradient_accumulation_steps'] = config.grad_accum_steps
     # wrap model with DeepSpeed
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
         model=model,
-        model_parameters=model.parameters(),
+        model_parameters=model.build_param_groups(weight_decay=config.weight_decay),
         config=ds_config
     )
+    lr_scheduler = LearningRateScheduler(optimizer=optimizer, config=config, lower_pct=0.1, use_deepspeed=True)
+    lr_scheduler.init()
 
     # create tensorboard logger
     if master_process:
@@ -168,16 +194,16 @@ if __name__ == '__main__':
         tb_logger = None
 
     # begin training
-    max_steps = 20
-    for step in range(max_steps):
+    for step in range(config.max_steps):
         model_engine.train()
         # get batch data
-        batch = train_loader.next_batch()
+        batch = next(train_loader)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         
         # call model
-        loss, outputs = train_step_ds(model_engine, batch, config.nce_loss_lambda)
+        loss, outputs = train_step_ds(config, model_engine, batch)
         # backward
+        lr_scheduler.step()
         model_engine.backward(loss)
         model_engine.step()
         
@@ -187,16 +213,14 @@ if __name__ == '__main__':
                 "nce_loss": outputs.nce_loss.item(),
                 "ce_loss": outputs.ce_loss.item(),
                 "loss": loss.item(),
-                "learning_rate": model_engine.get_lr()[0]
+                "learning_rate": lr_scheduler.get_lr(),
             }
             tb_logger.log(metrics, step + 1, prefix="train")
         
         # validation step
         if (step + 1) % config.eval_steps == 0:
             valid_context_ds(
-                model_engine, valid_loader, step + 1,
-                save_dir=config.get_save_dir(),
-                nce_loss_lambda=config.nce_loss_lambda,
+                config, model_engine, valid_loader, step + 1,
                 device=device,
                 master_process=master_process,
                 tb_logger=tb_logger

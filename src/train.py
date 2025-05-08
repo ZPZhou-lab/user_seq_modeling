@@ -17,6 +17,7 @@ class LearningRateScheduler:
     def __init__(self, 
         config: TrainingConfig,
         optimizer: Optimizer,
+        use_deepspeed: bool=False,
         lower_pct: float=0.1
     ):
         self.optimizer          = optimizer
@@ -25,6 +26,8 @@ class LearningRateScheduler:
         self.top_warmup_steps   = config.top_warmup_steps
         self.max_lr             = config.learning_rate
         self.min_lr             = lower_pct * config.learning_rate
+        self.use_deepspeed      = use_deepspeed
+        self.accum_steps        = config.grad_accum_steps if use_deepspeed else 1
         self.current_step       = 0
         self._local_step        = 0
         self._top_warmup_flag   = True if config.top_warmup_steps > 0 else False
@@ -37,10 +40,25 @@ class LearningRateScheduler:
                 'lr': group.get('lr', config.learning_rate),
                 'weight_decay': group.get('weight_decay', config.weight_decay)})
     
+    def init(self):
+        """initialize the learning rate for each parameter group"""
+        # set the learning rate for each parameter group
+        for param_group in self.optimizer.param_groups:
+            name = param_group['name'].split('.')[0]
+            if name == 'classifier':
+                param_group['lr'] = self.min_lr
+            else:
+                param_group['lr'] = 0.0
+
     def step(self):
-        """update the learning rate for each step"""
+        """update the learning rate for each step consider accumlation steps"""
         self.current_step += 1
-        
+        # if reach accumulation steps, update the learning rate
+        if self.current_step % self.accum_steps == 0:
+            self._step()
+    
+    def _step(self):
+        """update the learning rate for each step"""        
         # stap 1: warmup for head classifier
         if self._top_warmup_flag:
             self._local_step += 1

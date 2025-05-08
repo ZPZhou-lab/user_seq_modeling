@@ -117,7 +117,6 @@ if __name__ == '__main__':
     optimizer = raw_model.build_optimizer(learning_rate=config.learning_rate)
     lr_scheduler = LearningRateScheduler(config=config, optimizer=optimizer, lower_pct=0.1)
     
-
     if master_process:
         print("="*30 + " BEGIN TRAININ " + "="*30)
         # create tensorboard logger
