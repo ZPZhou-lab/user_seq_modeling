@@ -15,6 +15,7 @@ from src.train import (
     eval_performance
 )
 import deepspeed
+from deepspeed import DeepSpeedEngine
 import json
 import argparse
 import time
@@ -45,7 +46,7 @@ config = TrainingConfig(
     train_data_dir='./data',
     valid_data_dir='./data',
     model_path=ModelPath.Qwen3_1B,
-    shard_size=10,
+    shard_size=100,
     batch_size=2,
     max_seq_len=32,
     max_text_len=32,
@@ -58,9 +59,9 @@ config = TrainingConfig(
     top_warmup_steps=20,
     warmup_steps=100,
     grad_accum_steps=4,
-    max_steps=50,
-    log_freq=1,
-    eval_steps=50,
+    max_steps=120,
+    log_freq=20,
+    eval_steps=60,
     max_evel_iter=100,
     temprature=0.05,
     nce_threshold=0.99,
@@ -82,11 +83,67 @@ def worker_setup(local_rank, seed=42):
     return local_rank, device, master_process
 
 # training logic for DeepSpeed
-def train_step_ds(config: TrainingConfig, model, batch):
-    outputs: HierarchicalModelOutput = model(**batch)
-    loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
+# def train_step_ds(config: TrainingConfig, model, batch):
+#     outputs: HierarchicalModelOutput = model(**batch)
+#     loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
     
-    return loss, outputs
+#     return loss, outputs
+
+def train_step_ds(
+    config: TrainingConfig,
+    model: DeepSpeedEngine,
+    train_loader,
+    lr_scheduler: LearningRateScheduler,
+    step: int,
+    ddp: bool=False,
+    device: str='cuda',
+    master_process: bool=False,
+    tb_logger: TensorboardLogger = None,
+):
+    # training loop
+    model.train()
+    s_time = time.time()
+    loss_tracker = ScalerAccumulator()
+    model.zero_grad()
+
+    for micro_step in range(config.grad_accum_steps):
+        batch = next(train_loader)
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        # call model
+        outputs: HierarchicalModelOutput = model(**batch)
+        # calculate loss
+        loss = config.nce_loss_lambda * outputs.nce_loss + outputs.ce_loss
+        loss = loss / config.grad_accum_steps
+        loss_tracker.update(
+            nce_loss=outputs.nce_loss, 
+            ce_loss=outputs.ce_loss, 
+            loss=loss
+        )
+        model.backward(loss)
+
+    # sync loss_tracker
+    loss_tracker.synchronize(ddp)
+    loss_dict = loss_tracker.values
+    # set learning rate
+    lr_scheduler.step()
+    model.step()
+    e_time = time.time()
+    time_used = (e_time - s_time) / config.grad_accum_steps
+
+    if master_process and tb_logger is not None:
+        # accumulate the metrics
+        tb_logger.accum(
+            nce_loss=loss_dict['nce_loss'],
+            ce_loss=loss_dict['ce_loss'],
+            loss=loss_dict['loss'],
+            time_per_iter=time_used
+        )
+        # Export metrics
+        if tb_logger.trigger_logger(step):
+            metrics = tb_logger.values
+            metrics['learning_rate'] = lr_scheduler.get_lr()
+            tb_logger.log(metrics, step, prefix="train")
+
 
 # validation logic for DeepSpeed
 def valid_context_ds(
@@ -175,7 +232,6 @@ if __name__ == '__main__':
     # load DeepSpeed configuration
     ds_config = json.load(open('ds_config.json'))
     ds_config['train_micro_batch_size_per_gpu'] = config.batch_size
-    ds_config['gradient_accumulation_steps'] = config.grad_accum_steps
     # wrap model with DeepSpeed
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
@@ -183,7 +239,7 @@ if __name__ == '__main__':
         model_parameters=model.build_param_groups(weight_decay=config.weight_decay),
         config=ds_config
     )
-    lr_scheduler = LearningRateScheduler(optimizer=optimizer, config=config, lower_pct=0.1, use_deepspeed=True)
+    lr_scheduler = LearningRateScheduler(optimizer=optimizer, config=config, lower_pct=0.1, use_deepspeed=False)
     lr_scheduler.init()
 
     # create tensorboard logger
@@ -195,38 +251,67 @@ if __name__ == '__main__':
 
     # begin training
     for step in range(config.max_steps):
-        model_engine.train()
-        # get batch data
-        batch = next(train_loader)
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        
-        # call model
-        loss, outputs = train_step_ds(config, model_engine, batch)
-        # backward
-        lr_scheduler.step()
-        model_engine.backward(loss)
-        model_engine.step()
-        
-        # log training metrics
-        if master_process and tb_logger.trigger_logger(step + 1):
-            metrics = {
-                "nce_loss": outputs.nce_loss.item(),
-                "ce_loss": outputs.ce_loss.item(),
-                "loss": loss.item(),
-                "learning_rate": lr_scheduler.get_lr(),
-            }
-            tb_logger.log(metrics, step + 1, prefix="train")
-        
+        # train step
+        train_step_ds(
+            config, model_engine, train_loader, lr_scheduler, step + 1,
+            ddp=True,
+            device=device,
+            master_process=master_process,
+            tb_logger=tb_logger
+        )
         # validation step
         if (step + 1) % config.eval_steps == 0:
             valid_context_ds(
-                config, model_engine, valid_loader, step + 1,
+                config, model_engine, valid_loader, int(step + 1),
                 device=device,
                 master_process=master_process,
                 tb_logger=tb_logger
             )
             if master_process:
                 tb_logger.flush()
+
+    # # begin training
+    # for micro_step in range(config.max_steps * config.grad_accum_steps):
+    #     step = (micro_step + 1) / config.grad_accum_steps
+    #     s_time = time.time()
+    #     model_engine.train()
+    #     # get batch data
+    #     batch = next(train_loader)
+    #     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        
+    #     # call model
+    #     loss, outputs = train_step_ds(config, model_engine, batch)
+    #     # backward
+    #     lr_scheduler.step()
+    #     model_engine.backward(loss)
+    #     model_engine.step()
+    #     e_time = time.time()
+    #     time_used = (e_time - s_time)
+
+    #     # log training metrics
+    #     if master_process and tb_logger is not None:
+    #         # accumulate loss
+    #         tb_logger.accum(
+    #             nce_loss=outputs.nce_loss.item(),
+    #             ce_loss=outputs.ce_loss.item(),
+    #             loss=loss.item(),
+    #             time_per_iter=time_used
+    #         )
+    #         if tb_logger.trigger_logger(step):
+    #             metrics = tb_logger.values
+    #             metrics["learning_rate"] = lr_scheduler.get_lr()
+    #             tb_logger.log(metrics, int(step), prefix="train")
+        
+    #     # validation step
+    #     if step % config.eval_steps == 0:
+    #         valid_context_ds(
+    #             config, model_engine, valid_loader, int(step),
+    #             device=device,
+    #             master_process=master_process,
+    #             tb_logger=tb_logger
+    #         )
+    #         if master_process:
+    #             tb_logger.flush()
 
     # cleanup
     if master_process and tb_logger is not None:

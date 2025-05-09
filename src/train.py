@@ -6,7 +6,6 @@ import time
 import math
 from .arguments import TrainingConfig
 from .common import ScalerAccumulator, TensorAccumulator
-from .dataset import EventSequenceDataLoaderMeta
 from .hierarchical import HierarchicalModel, HierarchicalModelOutput
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import roc_auc_score
@@ -60,8 +59,9 @@ class LearningRateScheduler:
     def _step(self):
         """update the learning rate for each step"""        
         # stap 1: warmup for head classifier
+        self._local_step += 1
         if self._top_warmup_flag:
-            self._local_step += 1
+            
             lr_scale = min(1.0, self._local_step / self.top_warmup_steps)
             current_lr = self.min_lr + (self.max_lr - self.min_lr) * lr_scale
             
@@ -74,11 +74,10 @@ class LearningRateScheduler:
                     param_group['lr'] = 0.0
             # check if the current step is the last step of warmup
             # if so, reset step so as to start the next stage
-            if self.current_step == self.top_warmup_steps:
+            if self._local_step == self.top_warmup_steps:
                 self._top_warmup_flag = False
                 self._local_step = 0
         else:
-            self._local_step += 1
             # step 2: cos-decay with warmup for all parameters
             if self._local_step < self.warmup_steps:
                 current_lr = self._local_step / self.warmup_steps * self.max_lr
@@ -105,6 +104,7 @@ class TensorboardLogger:
     def __init__(self, log_dir, log_freq=1):
         self.writer = SummaryWriter(log_dir=log_dir)
         self.log_freq = log_freq
+        self._values = {'count': 0}
     
     def log(self, metrics, step, prefix="train"):
         """Log metrics to tensorboard
@@ -118,6 +118,26 @@ class TensorboardLogger:
                 self.writer.add_scalars(f"{prefix}/{key}", value, step)
             else:
                 self.writer.add_scalar(f"{prefix}/{key}", value, step)
+    
+    def accum(self, **kwargs):
+        """Accumulate the metrics to be logged"""
+        self._values['count'] += 1
+        for key, value in kwargs.items():
+            if key not in self._values:
+                self._values[key] = 0
+            self._values[key] += value
+    
+    @property
+    def values(self):
+        """Get the accumulated values"""
+        if len(self._values) == 1:
+            raise ValueError("Logger has no values to log")
+        values = {key: value / self._values['count'] for key, value in self._values.items()}
+        values.pop('count')
+        # reset the values
+        self._values = {'count': 0}
+
+        return values
     
     def close(self):
         self.writer.close()
@@ -179,20 +199,22 @@ def train_step(
 
     optimizer.step()
     torch.cuda.synchronize()
-    s_end = time.time()
-    time_used = (s_end - s_time)
+    e_time = time.time()
+    time_used = (e_time - s_time) / config.grad_accum_steps
 
-    if master_process and tb_logger.trigger_logger(step):
+    if master_process and tb_logger is not None:
+        # accumulate the metrics
+        tb_logger.accum(
+            nce_loss=loss_dict['nce_loss'],
+            ce_loss=loss_dict['ce_loss'],
+            loss=loss_dict['loss'],
+            time_per_iter=time_used,
+            grad_norm=norm.item() if isinstance(norm, torch.Tensor) else norm
+        )
         # Export metrics
-        metrics = {
-            **loss_dict,
-            "time_per_iter": time_used,
-            "grad_norm": norm.item() if isinstance(norm, torch.Tensor) else norm,
-            "learning_rate": lr_scheduler.get_lr()
-        }
-        
-        # Log to tensorboard at specified frequency
-        if tb_logger is not None and step % tb_logger.log_freq == 0:
+        if tb_logger.trigger_logger(step):
+            metrics = tb_logger.values
+            metrics['learning_rate'] = lr_scheduler.get_lr()
             tb_logger.log(metrics, step, prefix="train")
 
 
@@ -246,17 +268,14 @@ def valid_context(
     e_time = time.time()
     time_used = (e_time - s_time)
 
-    if master_process:
+    if master_process and tb_logger is not None:
         # Export metrics
         metrics = {
             **loss_dict,
             **eval_dict,
             "eval_time_cost": time_used,
         }
-        
-        # Log to tensorboard at specified frequency
-        if tb_logger is not None:
-            tb_logger.log(metrics, eval_step, prefix="valid")
+        tb_logger.log(metrics, eval_step, prefix="valid")
 
         # save the checkpoint
         raw_model = model.module if ddp else model

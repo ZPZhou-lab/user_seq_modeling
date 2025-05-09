@@ -190,10 +190,10 @@ class HierarchicalModel(nn.Module):
             {'name': 'classifier.with_wd',   'params': classifier_with_wd,   'weight_decay': weight_decay},
             {'name': 'classifier.without_wd','params': classifier_without_wd,'weight_decay': 0.0}
         ]
-        print(f"Prams of encoder    use weight-decay: {sum([p.numel() for p in encoder_with_wd])}")
-        print(f"Prams of encoder    not use weight-decay: {sum([p.numel() for p in encoder_without_wd])}")
-        print(f"Prams of classifier use weight-decay: {sum([p.numel() for p in classifier_with_wd])}")
-        print(f"Prams of classifier not use weight-decay: {sum([p.numel() for p in classifier_without_wd])}")
+        print(f"Params of encoder    use weight-decay: {sum([p.numel() for p in encoder_with_wd])}")
+        print(f"Params of encoder    not use weight-decay: {sum([p.numel() for p in encoder_without_wd])}")
+        print(f"Params of classifier use weight-decay: {sum([p.numel() for p in classifier_with_wd])}")
+        print(f"Params of classifier not use weight-decay: {sum([p.numel() for p in classifier_without_wd])}")
 
         return grouped_parameters
 

@@ -31,7 +31,7 @@ config = TrainingConfig(
     train_data_dir='./data',
     valid_data_dir='./data',
     model_path=ModelPath.Qwen3_1B,
-    shard_size=10,
+    shard_size=100,
     batch_size=2,
     max_seq_len=32,
     max_text_len=32,
@@ -41,12 +41,12 @@ config = TrainingConfig(
     log_dir='./logs',
     save_dir='./ckpt',
     learning_rate=1e-5,
-    top_warmup_steps=-1,
+    top_warmup_steps=20,
     warmup_steps=100,
-    grad_accum_steps=1,
-    max_steps=10,
-    log_freq=1,
-    eval_steps=10,
+    grad_accum_steps=4,
+    max_steps=120,
+    log_freq=20,
+    eval_steps=60,
     max_evel_iter=100,
     temprature=0.05,
     nce_threshold=0.99,
@@ -116,6 +116,7 @@ if __name__ == '__main__':
     
     optimizer = raw_model.build_optimizer(learning_rate=config.learning_rate)
     lr_scheduler = LearningRateScheduler(config=config, optimizer=optimizer, lower_pct=0.1)
+    lr_scheduler.init()
     
     if master_process:
         print("="*30 + " BEGIN TRAININ " + "="*30)
