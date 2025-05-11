@@ -168,11 +168,13 @@ def train_step(
     loss_tracker = ScalerAccumulator()
     optimizer.zero_grad()
 
+    batch_sizes = []
     for micro_step in range(config.grad_accum_steps):
         batch = next(train_loader)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         batch['num_negatives'] = train_loader.num_negatives
         batch['is_padded'] = config.padding
+        batch_sizes.append(batch['attention_mask'].size(0))
         
         # set gradient sync
         if ddp:
@@ -202,7 +204,8 @@ def train_step(
     optimizer.step()
     torch.cuda.synchronize()
     e_time = time.time()
-    time_used = (e_time - s_time) / config.grad_accum_steps
+    actual_batch_size = sum(batch_sizes)
+    time_used = (e_time - s_time) / actual_batch_size
 
     if master_process and tb_logger is not None:
         # accumulate the metrics
@@ -211,14 +214,17 @@ def train_step(
             ce_loss=loss_dict['ce_loss'],
             loss=loss_dict['loss'],
             time_per_iter=time_used,
+            batch_size=actual_batch_size,
             grad_norm=norm.item() if isinstance(norm, torch.Tensor) else norm
         )
         # Export metrics
         if tb_logger.trigger_logger(step):
             metrics = tb_logger.values
-            metrics['learning_rate'] = lr_scheduler.get_lr()
+            ce_loss, nce_loss = metrics.pop('ce_loss'), metrics.pop('nce_loss')
             raw_model = model.module if ddp else model
             metrics['temperature'] = raw_model.temperature
+            metrics['lr'] = lr_scheduler.get_lr()
+            metrics['task'] = {'ce_loss': ce_loss, 'nce_loss': config.nce_loss_lambda * nce_loss}
             tb_logger.log(metrics, step, prefix="train")
 
 

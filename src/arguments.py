@@ -29,6 +29,7 @@ class TrainingConfig:
     model_path: ModelPath
     shard_size: int     = 10000
     batch_size: int     = 16
+    user_max_tokens:int = -1
     max_seq_len: int    = 64
     max_text_len: int   = 32
     num_negatives: int  = 256

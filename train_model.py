@@ -32,9 +32,10 @@ config = TrainingConfig(
     model_path=ModelPath.Qwen3_1B,
     shard_size=1000,
     batch_size=2,
+    user_max_tokens=128,
     max_seq_len=32,
     max_text_len=32,
-    num_negatives=64,
+    num_negatives=128,
     padding=False,
     add_user_token=True,
     # training args

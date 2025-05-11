@@ -1,10 +1,11 @@
+from threading import local
 import torch
 import math
 import random
 from transformers import AutoTokenizer
 from torch.utils.data import Sampler, DataLoader
 from src.arguments import TrainingConfig, TimeEmbeddingConfig
-from typing import List
+from typing import List, Iterator
 from abc import abstractmethod
 from datasets import Dataset
 from .utils import (
@@ -121,6 +122,13 @@ class EventSequenceDataLoaderMeta:
         local_idx = global_idx - self.curr_shard_range[0]
         return local_idx
 
+    def in_curr_shard(self, global_idx: int):
+        """
+        check if the global index is in the current shard
+        """
+        start, limit = self.curr_shard_range
+        return start <= global_idx < (start + limit)
+
     def _sampling_event_sequence(self, num_samples: int, idx: int=None):
         """
         sampling events from the current shard
@@ -169,7 +177,10 @@ class EventSequenceDataLoaderMeta:
 
 
 class SequentialDistributedSampler(Sampler):
-    def __init__(self, dataset, world_size: int=None, rank: int=None):
+    def __init__(self, 
+        dataset: EventSequenceDataLoaderMeta, 
+        world_size: int=None, 
+        rank: int=None):
         self.dataset = dataset
         _set_world_size_and_rank(self, world_size, rank)
 
@@ -189,6 +200,51 @@ class SequentialDistributedSampler(Sampler):
     def __len__(self):
         shards = [limit for _, limit in self.dataset._shards_loc]
         return sum(shards)
+
+
+class DynamicBatchSampler:
+    def __init__(
+        self,
+        sampler: SequentialDistributedSampler,
+        user_max_tokens: int
+    ):
+        self.sampler = sampler
+        self.user_max_tokens = user_max_tokens
+
+    def __iter__(self) -> Iterator[List[int]]:
+        # 2. total user sequence length should not exceed max_tokens
+        batch, user_tokens = [], 0
+        for idx in self.sampler:
+            # 1. batch should not cross shard if this is not the first sample
+            if len(batch) > 0 and self.sampler.dataset.in_curr_shard(idx):
+                local_idx = self.sampler.dataset._get_local_idx(idx)
+                seq_len = len(self.sampler.dataset.curr_shard[local_idx]['events'])
+                # 3. check if the batch is full
+                if user_tokens + seq_len > self.user_max_tokens:
+                    # check if the batch is empty
+                    if len(batch) > 0:
+                        yield batch
+                        batch, user_tokens = [idx], seq_len
+                else:
+                    batch.append(idx)
+                    user_tokens += seq_len
+            else:
+                # fetch the next shard
+                # print(f"get next shard at batch {batch}")
+                local_idx = self.sampler.dataset._get_local_idx(idx)
+                seq_len = len(self.sampler.dataset.curr_shard[local_idx]['events'])
+                if len(batch) > 0:
+                    yield batch
+                    batch, user_tokens = [idx], seq_len
+                else:
+                    user_tokens += seq_len
+                    batch.append(idx)
+
+    def __len__(self) -> int:
+        # can not be determined in advance since the batch size is dynamic
+        # estimation is len(dataset) * avg_seq_len / user_max_tokens
+        # return len(self.sampler.dataset) // (self.user_max_tokens)
+        return len(self.sampler.dataset)
 
 
 class EventSequencePairLoaaderWrapper:
@@ -216,16 +272,31 @@ def build_dataloader(
     **kwargs
 ):
     sampler = SequentialDistributedSampler(dataset, rank=rank)
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        sampler=sampler,
-        collate_fn=dataset.sequential_event_collate_fn,
-        num_workers=kwargs.get('num_workers', 0),
-        pin_memory=kwargs.get('pin_memory', True),
-        multiprocessing_context=kwargs.get('multiprocessing_context', None),
-        persistent_workers=True if kwargs.get('num_workers', 0) > 0 else False,
-        drop_last=True
-    )
+    if config.user_max_tokens < 0:
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            collate_fn=dataset.sequential_event_collate_fn,
+            num_workers=kwargs.get('num_workers', 0),
+            pin_memory=kwargs.get('pin_memory', True),
+            multiprocessing_context=kwargs.get('multiprocessing_context', None),
+            persistent_workers=True if kwargs.get('num_workers', 0) > 0 else False,
+            drop_last=True
+        )
+    else:
+        batch_sampler = DynamicBatchSampler(
+            sampler=sampler,
+            user_max_tokens=config.user_max_tokens
+        )
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=dataset.sequential_event_collate_fn,
+            num_workers=kwargs.get('num_workers', 0),
+            pin_memory=kwargs.get('pin_memory', True),
+            multiprocessing_context=kwargs.get('multiprocessing_context', None),
+            persistent_workers=True if kwargs.get('num_workers', 0) > 0 else False
+        )
     
     return EventSequencePairLoaaderWrapper(data_loader)
