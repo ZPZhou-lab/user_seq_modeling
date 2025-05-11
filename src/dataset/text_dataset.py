@@ -1,17 +1,8 @@
-import os
 import torch
-import random
-import math
 from typing import List
-import pandas as pd
-from transformers import AutoTokenizer
 from torch.utils.data import Dataset
-from .dataset import (
-    _set_world_size_and_rank,
-    get_action_time_diff,
-    format_event
-)
-from src.arguments import TrainingConfig, TimeEmbeddingConfig
+from .dataset import EventSequenceDataLoaderMeta
+from .utils import get_action_time_diff
 from datasets import Dataset
 
 
@@ -20,146 +11,20 @@ def format_event(event_list: List[str]):
     return action_time, event
 
 
-class TableReader:
-    def __init__(self, table: str):
-        shards = os.listdir(table)
-        shards = sorted([shard for shard in shards if shard.endswith('.pkl')])
-        assert len(shards) > 0, f"no shards found in {table}"        
-        shards = [os.path.join(table, shard) for shard in shards]
-        self.reader = pd.concat([torch.load(shard, weights_only=False) for shard in shards], ignore_index=True)
-
-    def to_pandas(self, start: int=0, limit: int=-1):
-        if limit == -1:
-            limit = len(self.reader)
-        return self.reader.iloc[start:(start + limit)].copy()
-    
-    @property
-    def table_size(self):
-        return len(self.reader)
-    
-    def __len__(self):
-        return len(self.reader)
-
-
-class TextEventSequencePairDataset:
-    def __init__(self, 
-                 config: TrainingConfig,
-                 ts_config: TimeEmbeddingConfig,
-                 split: str='train',
-                 prefix_prompt: str='',
-                 world_size: int=None, 
-                 rank: int=None):
-        """
-        Parameters
-        ----------
-        config: TrainingConfig
-            The training configuration.
-        ts_config: TimeEmbeddingConfig
-            The time embedding configuration.
-        split: str
-            The dataset split, either 'train' or 'valid'.
-        prefix_prompt: str
-            The prefix prompt for the event.
-        world_size: int
-            The number of processes in the distributed training.
-        rank: int
-            The rank of the current process in the distributed training.
-        """
-        _set_world_size_and_rank(self, world_size, rank)
-        self.config = config
-        self.ts_config = ts_config
-        self.split = split
-        self.prefix_prompt = prefix_prompt
-        # save config
-        self.shard_size = config.shard_size
-        self.batch_size = config.batch_size
-        self.max_text_len = config.max_text_len
-        self.max_seq_len  = config.max_seq_len
-        
-        # create tokenizer and add special tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_path.value, trust_remote_code=True)
-        self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.tokenizer.add_tokens(config.EVENT_TOEKN, special_tokens=True)
-        self.tokenizer.padding_side = "left"
-        self.num_negatives = math.ceil(config.num_negatives / (self.batch_size * self.world_size))
-        
-        # init current shard
-        self._preload_dataset()
-        self.curr_shard_idx = 0
-        self.curr_shard = self.safe_load()
-    
-    def _preload_dataset(self):
-        data_dir = self.config.train_data_dir if self.split == 'train' else self.config.valid_data_dir
-        self.reader = TableReader(table=data_dir)
-        
-        # create shard indices
-        n_total = len(self.reader)
-        self._shards_loc = []
-        for shard_s in range(0, n_total, self.shard_size * self.world_size):
-            shard_e = shard_s + self.shard_size * self.world_size
-            if shard_e <= n_total:
-                start = shard_s + self.rank * self.shard_size
-                limit = (self.shard_size // self.batch_size) * self.batch_size
-            else:
-                # split the last part into `world_size` shards if remain > batch_size * world_size
-                remain = n_total - shard_s
-                global_batch = self.world_size * self.batch_size
-                if remain > global_batch:
-                    last_shard_size = (remain // global_batch) * global_batch // self.world_size
-                    start = shard_s + self.rank * last_shard_size
-                    limit = last_shard_size
-                else:
-                    # remain can not be split into `world_size` chunks to build a batch
-                    break
-            self._shards_loc.append((start, limit))
-        # the total samples in the dataset
-        self._total = sum([limit for _, limit in self._shards_loc]) * self.world_size
-    
-    def __len__(self):
-        return self._total
-    
+class TextEventSequencePairDataset(EventSequenceDataLoaderMeta):    
     def safe_load(self):
         """load the current shard"""
         start, limit = self._shards_loc[self.curr_shard_idx]
         frame = self.reader.to_pandas(start=start, limit=limit)
         shard = Dataset.from_pandas(frame)
         return shard
-    
-    @property
-    def curr_shard_range(self):
-        """get the shard range"""
-        return self._shards_loc[self.curr_shard_idx]
-    
-    @property
-    def curr_shard_size(self):
-        """get the shard size"""
-        return self._shards_loc[self.curr_shard_idx][1]
-    
-    def _get_local_idx(self, global_idx: int):
-        """check if need to load the next shard and return the local index for the current shard"""
-        shard_end = self.curr_shard_range[0] + self.curr_shard_range[1]
-        # fetch the next shard if the current shard reaches the end
-        if global_idx >= shard_end:
-            self.curr_shard_idx = (self.curr_shard_idx + 1) % len(self._shards_loc)
-            self.curr_shard = self.safe_load()
-        elif global_idx < self.curr_shard_range[0]:
-            self.curr_shard_idx = 0
-            self.curr_shard = self.safe_load()
-        
-        # get the local index in the current shard
-        local_idx = global_idx - self.curr_shard_range[0]
-        return local_idx
-    
-    def __getitem__(self, global_idx: int):
-        """
-        generate a sample from the dataset
-        """
 
+    def __getitem__(self, global_idx: int):
         # find the shard and local index
         local_idx = self._get_local_idx(global_idx)
         
         observe_time = self.curr_shard[local_idx]['observe_time']
-        pos_event_seq = self.curr_shard[local_idx]['event']
+        pos_event_seq = self.curr_shard[local_idx]['events']
         label = self.curr_shard[local_idx]['label']
         
         # padding event_seq into max_seq_len
@@ -211,41 +76,6 @@ class TextEventSequencePairDataset:
             'time_ids':         torch.as_tensor(time_ids, dtype=torch.long),
             'labels':           label
         }
-
-    def _sampling_event_sequence(self, num_samples: int, idx: int=None):
-        """
-        sampling events from the current shard
-        if `idx` provided, using event from other samples for negative sampling
-        """
-        event_seq = []
-        for i in range(num_samples):
-            # generate random index
-            rnd_idx = random.randint(0, len(self.curr_shard) - 1)
-            while idx is not None and rnd_idx == idx:
-                # get the negative sample if idx is provided
-                rnd_idx = random.randint(0, len(self.curr_shard) - 1)
-            
-            # sampling a event
-            event_len = len(self.curr_shard[rnd_idx]['event'])
-            event = self.curr_shard[rnd_idx]['event'][random.randint(0, event_len - 1)]
-            event_seq.append(event)
-        
-        return event_seq
-    
-    def _padding_event_sequence(self, event_seq: List[List[str]]):
-        """
-        padding event sequence into max_seq_len, and create attention mask
-        """
-        event_seq = event_seq[-self.max_seq_len:]
-        pad_len = self.max_seq_len - len(event_seq)
-        mask = [1] * len(event_seq)
-        if pad_len > 0:
-            pad_event_seq = self._sampling_event_sequence(pad_len)
-            # add padding event seq
-            event_seq = pad_event_seq + event_seq
-            mask = [0] * pad_len + mask
-
-        return event_seq, mask
 
 
 def sequential_event_collate_fn(samples):

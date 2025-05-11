@@ -1,35 +1,18 @@
-import os
 import torch
-from transformers import AutoTokenizer
-import torch.distributed as dist
-from torch.utils.data import Sampler, DataLoader
 import math
 import random
+from transformers import AutoTokenizer
+from torch.utils.data import Sampler, DataLoader
 from src.arguments import TrainingConfig, TimeEmbeddingConfig
 from typing import List
 from abc import abstractmethod
-from datetime import datetime
+from datasets import Dataset
+from .utils import (
+    _set_world_size_and_rank,
+    TableReader
+)
 import logging
 logger = logging.getLogger('Dataset')
-
-def format_event(event_list: List[str]):
-    action_time, event = event_list
-    return action_time, event
-
-
-def _set_world_size_and_rank(obj, world_size: int, rank: int):
-    """
-    Set the world size and rank for distributed training.
-    """
-    if world_size is None:
-        obj.world_size = dist.get_world_size() if dist.is_initialized() else 1
-    else:
-        obj.world_size = world_size
-    
-    if rank is None:
-        obj.rank = dist.get_rank() if dist.is_initialized() else 0
-    else:
-        obj.rank = rank
 
 
 class EventSequenceDataLoaderMeta:
@@ -39,25 +22,23 @@ class EventSequenceDataLoaderMeta:
     def __init__(self, 
         config: TrainingConfig, 
         ts_config: TimeEmbeddingConfig,
-        rank: int = 0,
-        prefix_prompt: str = '',
         split: str = 'train',
+        prefix_prompt: str = '',
+        world_size: int=None, 
+        rank: int = None
     ):
+        _set_world_size_and_rank(self, world_size, rank)
         self.config = config
         self.ts_config = ts_config
-        self.rank = rank
-        self.world_size     = dist.get_world_size() if dist.is_initialized() else 1
-        self.prefix_prompt  = prefix_prompt
         self.split          = split
-        self.data_dir       = config.train_data_dir if split == 'train' else config.valid_data_dir
-        self.model_path     = config.model_path
+        self.prefix_prompt  = prefix_prompt
+        # save config
+        self.shard_size     = config.shard_size
         self.batch_size     = config.batch_size
         self.max_seq_len    = config.max_seq_len
         self.max_text_len   = config.max_text_len
         # create tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path.value, trust_remote_code=True)
-        # add special tokens
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_path.value, trust_remote_code=True)
         self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.tokenizer.add_tokens(config.EVENT_TOEKN, special_tokens=True)
         self.tokenizer.padding_side = "left"
@@ -65,69 +46,79 @@ class EventSequenceDataLoaderMeta:
 
         # preload metadata
         self._preload_dataset()
+        self.curr_shard_idx = 0
+        self.curr_shard = self.safe_load()
 
     def _preload_dataset(self):
-        """preload dataset and create shards info"""
-        shards = os.listdir(self.data_dir)
-        shards = sorted([shard for shard in shards if shard.endswith('.pkl')])
-        assert len(shards) > 0, f"no shards found in {self.data_dir}"
+        self.data_dir = self.config.train_data_dir if self.split == 'train' else self.config.valid_data_dir
+        reader = TableReader(table=self.data_dir)
         
-        self.shards = [os.path.join(self.data_dir, shard) for shard in shards]
-        if self.rank == 0:
-            logger.info(f"Found {len(self.shards)} shards in {self.data_dir}")
-        
-        # create shard info
-        self.shard_samples, self.cumulative_samples = [], [0]
-        for shard in self.shards:
-            samples = self.safe_load(shard)
-            self.shard_samples.append(len(samples))
-            self.cumulative_samples.append(self.cumulative_samples[-1] + len(samples))
-        self.total_samples = self.cumulative_samples[-1]
-        
-        # init current shard
-        self.current_pos = 0
-        self.current_shard_idx = 0
-        self.current_shard = self.safe_load()
-
+        # create shard indices
+        n_total = reader.table_size
+        self._shards_loc = []
+        for shard_s in range(0, n_total, self.shard_size * self.world_size):
+            shard_e = shard_s + self.shard_size * self.world_size
+            if shard_e <= n_total:
+                start = shard_s + self.rank * self.shard_size
+                limit = (self.shard_size // self.batch_size) * self.batch_size
+            else:
+                # split the last part into `world_size` shards if remain > batch_size * world_size
+                remain = n_total - shard_s
+                global_batch = self.world_size * self.batch_size
+                if remain > global_batch:
+                    last_shard_size = (remain // global_batch) * global_batch // self.world_size
+                    start = shard_s + self.rank * last_shard_size
+                    limit = last_shard_size
+                else:
+                    # remain can not be split into `world_size` chunks to build a batch
+                    break
+            self._shards_loc.append((start, limit))
+        # the total samples in the dataset
+        self._total = sum([limit for _, limit in self._shards_loc]) * self.world_size
+    
     def __len__(self):
-        return self.total_samples
+        return self._total
 
+    def safe_load(self):
+        """load the current shard"""
+        start, limit = self._shards_loc[self.curr_shard_idx]
+        frame = TableReader(table=self.data_dir).to_pandas(start=start, limit=limit)
+        shard = Dataset.from_pandas(frame)
+        return shard
+    
     @property
-    def total_steps(self):
-        """total steps for one epoch iteration"""
-        return self.total_samples // (self.batch_size * self.world_size)
-
-    def next_batch(self):
-        """get the next batch of data"""
-        
-        end = self.current_pos + self.batch_size * self.world_size
-        if end > self.total_samples:
-            # reset current pos
-            self.current_pos = 0
-            self.current_shard_idx = 0
-            self.current_shard = self.safe_load()
-            return self.next_batch()
-
-        # get the global_idx in current batch
-        buf = list(range(self.rank + self.current_pos, end, self.world_size))
-        self.current_pos += self.batch_size * self.world_size
-
-        # get the current batch
-        return self._preprocess_samples(buf)
-
+    def curr_shard_range(self):
+        """get the shard range"""
+        return self._shards_loc[self.curr_shard_idx]
+    
+    @property
+    def curr_shard_size(self):
+        """get the shard size"""
+        return self._shards_loc[self.curr_shard_idx][1]
+    
 
     @abstractmethod
-    def _preprocess_samples(self, buf: List[int]):
+    def __getitem__(self, idx: int):
         """
-        preprocess samples for given buf samples indices
-
-        Parameters
-        ----------
-        buf : List[int]
-            list of global indices for the current batch
+        generate a sample from the dataset
         """
-        raise NotImplementedError("_preprocess_samples() not implemented")
+        raise NotImplementedError("Please implement __getitem__ method in the subclass.")
 
+
+    def _get_local_idx(self, global_idx: int):
+        """check if need to load the next shard and return the local index for the current shard"""
+        shard_end = self.curr_shard_range[0] + self.curr_shard_range[1]
+        # fetch the next shard if the current shard reaches the end
+        if global_idx >= shard_end:
+            self.curr_shard_idx = (self.curr_shard_idx + 1) % len(self._shards_loc)
+            self.curr_shard = self.safe_load()
+        elif global_idx < self.curr_shard_range[0]:
+            self.curr_shard_idx = 0
+            self.curr_shard = self.safe_load()
+        
+        # get the local index in the current shard
+        local_idx = global_idx - self.curr_shard_range[0]
+        return local_idx
 
     def _sampling_event_sequence(self, num_samples: int, idx: int=None):
         """
@@ -137,14 +128,14 @@ class EventSequenceDataLoaderMeta:
         event_seq = []
         for i in range(num_samples):
             # generate random index
-            rnd_idx = random.randint(0, len(self.current_shard) - 1)
+            rnd_idx = random.randint(0, len(self.curr_shard) - 1)
             while idx is not None and rnd_idx == idx:
                 # get the negative sample if idx is provided
-                rnd_idx = random.randint(0, len(self.current_shard) - 1)
+                rnd_idx = random.randint(0, len(self.curr_shard) - 1)
             
             # sampling a event
-            event_len = len(self.current_shard[rnd_idx]['event'])
-            event = self.current_shard[rnd_idx]['event'][random.randint(0, event_len - 1)]
+            event_len = len(self.curr_shard[rnd_idx]['events'])
+            event = self.curr_shard[rnd_idx]['events'][random.randint(0, event_len - 1)]
             event_seq.append(event)
         
         return event_seq
@@ -168,98 +159,8 @@ class EventSequenceDataLoaderMeta:
         """
         reset the current shard and position
         """
-        self.current_pos = 0
-        self.current_shard_idx = 0
-        self.current_shard = self.safe_load()
-        
-    def get_local_idx(self, global_idx: int):
-        """
-        get the local index from global index
-        """
-        shard_idx = next(
-            i for i, cum in enumerate(self.cumulative_samples) if global_idx < cum
-        ) - 1
-        if shard_idx != self.current_shard_idx:
-            self.current_shard_idx = shard_idx
-            self.current_shard = self.safe_load()
-        
-        local_idx = global_idx - self.cumulative_samples[shard_idx]
-        return local_idx
-    
-    def safe_load(self, path: str=None):
-        """
-        safe load the dataset shard
-        """
-        if path is None:
-            path = self.shards[self.current_shard_idx]
-
-        max_retries = 5
-        for retry in range(max_retries):
-            try:
-                return torch.load(path, map_location='cpu', weights_only=True)
-            except (AssertionError, Exception) as e:
-                if retry < max_retries - 1:
-                    logger.warning(f"Error loading shard {path}, retrying {retry+1}/{max_retries}: {str(e)}")
-                    import time
-                    time.sleep(1)  # Add a small delay before retrying
-                else:
-                    logger.error(f"Failed to load shard after {max_retries} attempts: {str(e)}")
-                    # Return empty list as fallback to prevent crash
-                    raise e
-
-
-def get_action_time_diff(
-    action_time: str, 
-    observe_time: str,
-    mode: str='relative',
-    max_diff_day: int=720,
-    max_year_ago: int=10
-):
-    """
-    locate the `action_time` as diff from `observe_time`.
-
-    Parameters
-    ----------
-    action_time: str
-        the time when the action happened.
-    observe_time: str
-        the time when do the observation.
-    mode: str
-        the mode of time diff, one of `relative`, `absolute`, default is `relative`.\n
-        - `relative`: locate the time as diff in tuple `(days, hours, minutes and seconds)`.\n
-        - `absolute`: locate the time as tuple `(-year, month, day, hour, minute, second)`.\n
-    max_diff_day: int
-        the max diff day, default is 720 days, time_diff > 720 days will be truncated to 720 days,\
-        only used when mode is `relative`
-    max_year_age: int
-        the max year age, default is 10 years, year > 10 years will be truncated to 10 years,\
-        only used when mode is `absolute`
-    """
-    # calculate the date diff from now
-    # get the day, hour, minute, second diff
-    obs_time = datetime.strptime(observe_time, '%Y-%m-%d %H:%M:%S')
-    act_time = datetime.strptime(action_time, '%Y-%m-%d %H:%M:%S')
-    diff = obs_time - act_time
-    # Extract total days
-    day_diff = diff.days
-
-    if mode == 'relative':
-        if day_diff >= max_diff_day:
-            return (max_diff_day - 1, 23, 59, 59)
-        # Calculate remaining seconds
-        remainder = diff.seconds
-        # Extract hours, minutes, seconds
-        hour_diff = remainder // 3600
-        remainder = remainder % 3600
-        minute_diff = remainder // 60
-        second_diff = remainder % 60
-        return (day_diff, hour_diff, minute_diff, second_diff)
-    elif mode == 'absolute':
-        year = max(obs_time.year - act_time.year, 0)
-        year = min(year, max_year_ago)
-        return (year, act_time.month, act_time.day, act_time.hour, act_time.minute, act_time.second)
-    else:
-        raise ValueError(f"Invalid mode: {mode}. Must be 'relative' or 'absolute'.")
+        self.curr_shard_idx = 0
+        self.curr_shard = self.safe_load()
 
 
 class SequentialDistributedSampler(Sampler):
@@ -288,6 +189,7 @@ class SequentialDistributedSampler(Sampler):
 class EventSequencePairLoaaderWrapper:
     def __init__(self, dataloader: DataLoader):
         self.dataloader = dataloader
+        self.num_negatives = dataloader.dataset.num_negatives
         self._iter = iter(dataloader)
     
     def __next__(self):

@@ -1,12 +1,12 @@
 import os
 import torch
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader
 import time
 import math
 from .arguments import TrainingConfig
 from .common import ScalerAccumulator, TensorAccumulator
 from .hierarchical import HierarchicalModel, HierarchicalModelOutput
+from .dataset import EventSequencePairLoaaderWrapper
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import roc_auc_score
 from typing import Dict
@@ -153,7 +153,7 @@ class TensorboardLogger:
 def train_step(
     config: TrainingConfig,
     model: HierarchicalModel,
-    train_loader: DataLoader,
+    train_loader: EventSequencePairLoaaderWrapper,
     optimizer: Optimizer,
     lr_scheduler: LearningRateScheduler,
     step: int,
@@ -171,6 +171,7 @@ def train_step(
     for micro_step in range(config.grad_accum_steps):
         batch = next(train_loader)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch['num_negatives'] = train_loader.num_negatives
         
         # set gradient sync
         if ddp:
@@ -221,7 +222,7 @@ def train_step(
 def valid_context(
     config: TrainingConfig,
     model: HierarchicalModel,
-    valid_loader: DataLoader,
+    valid_loader: EventSequencePairLoaaderWrapper,
     optimizer: Optimizer,
     eval_step: int,
     ddp: bool=False,
@@ -241,6 +242,7 @@ def valid_context(
             # get the current batch
             batch = next(valid_loader)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch['num_negatives'] = valid_loader.num_negatives
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 # call model

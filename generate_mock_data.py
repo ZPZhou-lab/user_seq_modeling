@@ -34,7 +34,7 @@ def generate_event_seq(max_seq_len: int=64):
     
     return {
         'observe_time': '2025-05-01 00:00:00',
-        'event': events,
+        'events': events,
         'label': random.choice([0, 1])
     }
 

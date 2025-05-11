@@ -62,7 +62,8 @@ class EventEncoder(nn.Module):
     def forward(self, 
         input_ids: torch.Tensor, 
         position_ids: torch.Tensor, 
-        seq_varlen: torch.Tensor
+        seq_varlen: torch.Tensor,
+        seq_len: int = None
     ) -> torch.Tensor:
         """
         encode events into hidden_states, a special token `[EVENT]` is padded to the end of each event
@@ -76,10 +77,12 @@ class EventEncoder(nn.Module):
             The position ids of the events with shape (sql_len, )
         seq_varlen: torch.Tensor
             The variable length of the event sequences with shape (batch, )
+        seq_len: int
+            To reshape the output hidden_states to (batch, seq_len, hiddens). If None, the output will be (batch, max_seq_len, hiddens).
         """
         # get the event_embeddings
         hidden_states = self.llm.get_input_embeddings()(input_ids.to(self.llm.device))
-        seq_len, embed_size = hidden_states.size(0), hidden_states.size(1)
+        _, embed_size = hidden_states.size(0), hidden_states.size(1)
         seq_varlen_cum = torch.cumsum(seq_varlen, dim=0)
 
         # using flash-attention to get the hidden states
@@ -91,7 +94,9 @@ class EventEncoder(nn.Module):
 
         # extract the last token hidden state and reshape it to (batch, seq_len, hidden)
         hidden_states = hidden_states[:, seq_varlen_cum - 1, :].squeeze(0)
-        hidden_states = hidden_states.view(-1, self.max_seq_len, embed_size)
+        if seq_len is None:
+            seq_len = self.max_seq_len
+        hidden_states = hidden_states.view(-1, seq_len, embed_size)
 
         return hidden_states
 

@@ -96,9 +96,11 @@ class HierarchicalModel(nn.Module):
                                               position_ids=pos_position_ids,
                                               seq_varlen=pos_varlen)
         if neg_input_ids is not None:
+            view_seq_len = kwargs.get('num_negatives', None)
             neg_hidden_states = self.encode_event(input_ids=neg_input_ids,
                                                   position_ids=neg_position_ids,
-                                                  seq_varlen=neg_varlen)
+                                                  seq_varlen=neg_varlen,
+                                                  seq_len=view_seq_len)
         else:
             neg_hidden_states = None
 
@@ -148,13 +150,14 @@ class HierarchicalModel(nn.Module):
     def encode_event(self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        seq_varlen: torch.Tensor
+        seq_varlen: torch.Tensor,
+        seq_len: int = None
     ):
         """
         encode event inputs into hidden_states
         """
         return self.event_encoder(
-            input_ids=input_ids, position_ids=position_ids, seq_varlen=seq_varlen
+            input_ids=input_ids, position_ids=position_ids, seq_varlen=seq_varlen, seq_len=seq_len
         )
     
     def build_optimizer(self, 
@@ -190,10 +193,11 @@ class HierarchicalModel(nn.Module):
             {'name': 'classifier.with_wd',   'params': classifier_with_wd,   'weight_decay': weight_decay},
             {'name': 'classifier.without_wd','params': classifier_without_wd,'weight_decay': 0.0}
         ]
-        print(f"Params of encoder    use weight-decay: {sum([p.numel() for p in encoder_with_wd])}")
-        print(f"Params of encoder    not use weight-decay: {sum([p.numel() for p in encoder_without_wd])}")
-        print(f"Params of classifier use weight-decay: {sum([p.numel() for p in classifier_with_wd])}")
-        print(f"Params of classifier not use weight-decay: {sum([p.numel() for p in classifier_without_wd])}")
+        if self.local_rank == 0:
+            print(f"Params of encoder    use weight-decay: {sum([p.numel() for p in encoder_with_wd])}")
+            print(f"Params of encoder    not use weight-decay: {sum([p.numel() for p in encoder_without_wd])}")
+            print(f"Params of classifier use weight-decay: {sum([p.numel() for p in classifier_with_wd])}")
+            print(f"Params of classifier not use weight-decay: {sum([p.numel() for p in classifier_without_wd])}")
 
         return grouped_parameters
 

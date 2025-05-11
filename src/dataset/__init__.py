@@ -1,17 +1,17 @@
 from .dataset import (
     EventSequenceDataLoaderMeta,
-    SequentialDistributedSampler,
-    build_dataloader
+    build_dataloader,
+    EventSequencePairLoaaderWrapper
 )
 from .text_dataset import (
     TextEventSequencePairDataset,
-    sequential_event_collate_fn,
+    sequential_event_collate_fn
 )
 
 __all__ = [
     'EventSequenceDataLoaderMeta',
     'build_dataloader',
-    'SequentialDistributedSampler'
+    'EventSequencePairLoaaderWrapper',
     'TextEventSequencePairDataset',
     'sequential_event_collate_fn'
 ]
