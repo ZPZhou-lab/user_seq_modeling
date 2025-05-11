@@ -4,6 +4,8 @@ import numpy as np
 import torch.nn.functional as F
 import torch.distributed as dist
 from dataclasses import dataclass
+
+from .arguments import TrainingConfig
 from .common import all_gather, create_device_info, ClassificationHead
 from .encoder_user import UserEncoder
 from .encoder_event import EventEncoder
@@ -22,24 +24,24 @@ class HierarchicalModelOutput:
 
 class HierarchicalModel(nn.Module):
     def __init__(self,
+        config: TrainingConfig,
         event_encoder: EventEncoder,
         user_encoder: UserEncoder,
-        temperature: float = 0.05,
-        nce_threshold: float = 0.99,
-        num_classes: int = None,
+        num_classes: int = None
     ):
         super(HierarchicalModel, self).__init__()
+        self.config = config
         self.local_rank, self.device = create_device_info()
         
         # load pretrained llm
         self.event_encoder = event_encoder
         self.user_encoder = user_encoder
+        self.add_user_token = config.add_user_token
 
         # add generative NCE loss
-                # add generative NCE loss
         self.nce_loss_func = GenerativeInfoNCELoss(
-            temperature=temperature,
-            nce_threshold=nce_threshold
+            temperature=config.temperature,
+            nce_threshold=config.nce_threshold
         )
         # add classifier head
         if num_classes is not None:
@@ -51,7 +53,10 @@ class HierarchicalModel(nn.Module):
             self.classifier.to(self.device)
         else:
             self.classifier = None
-
+    
+    @property
+    def temperature(self):
+        return self.nce_loss_func.temperature.exp().item()
 
     def forward(self,
         pos_input_ids: torch.Tensor,
@@ -62,7 +67,6 @@ class HierarchicalModel(nn.Module):
         neg_input_ids: torch.Tensor=None,
         neg_position_ids: torch.Tensor=None,
         neg_varlen: torch.Tensor=None,
-        add_user_token: bool = True,
         labels: torch.Tensor=None,
         **kwargs
     ):
@@ -87,14 +91,14 @@ class HierarchicalModel(nn.Module):
             The position ids for the negative event sequence.
         neg_varlen: (num_neg, )
             The variable length of the negative event sequence.
-        add_user_token: bool
-            Whether to add user token to the input embeddings. Default is True.
         labels: (batch, )
             The labels for the classification task. Default is None.
         """
+        is_padded = kwargs.get('is_padded', True)
         pos_hidden_states = self.encode_event(input_ids=pos_input_ids,
                                               position_ids=pos_position_ids,
-                                              seq_varlen=pos_varlen)
+                                              seq_varlen=pos_varlen,
+                                              is_padded=is_padded)
         if neg_input_ids is not None:
             view_seq_len = kwargs.get('num_negatives', None)
             neg_hidden_states = self.encode_event(input_ids=neg_input_ids,
@@ -104,11 +108,15 @@ class HierarchicalModel(nn.Module):
         else:
             neg_hidden_states = None
 
+
         predictions, user_embedding = self.user_encoder(
             event_embeddings=pos_hidden_states,
             attention_mask=attention_mask,
+            user_varlen=kwargs.get('user_varlen', None),
+            user_position_ids=kwargs.get('user_position_ids', None),
+            user_token_mask=kwargs.get('user_token_mask', None),
             time_ids=time_ids,
-            add_user_token=add_user_token
+            add_user_token=self.add_user_token
         )
    
         # add classifier head
@@ -129,6 +137,10 @@ class HierarchicalModel(nn.Module):
 
         # calculate the loss
         if neg_hidden_states is not None:
+            user_token_mask = kwargs.get('user_token_mask', None)
+            if user_token_mask is not None:
+                # mask the user token
+                pos_hidden_states = pos_hidden_states[~user_token_mask]
             nce_loss = self.nce_loss_func(
                 predictions=predictions, 
                 positives=pos_hidden_states, 
@@ -151,14 +163,13 @@ class HierarchicalModel(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         seq_varlen: torch.Tensor,
+        is_padded: bool = True,
         seq_len: int = None
     ):
         """
         encode event inputs into hidden_states
         """
-        return self.event_encoder(
-            input_ids=input_ids, position_ids=position_ids, seq_varlen=seq_varlen, seq_len=seq_len
-        )
+        return self.event_encoder(input_ids, position_ids, seq_varlen, is_padded, seq_len)
     
     def build_optimizer(self, 
         learning_rate: float = 1e-5,
@@ -235,7 +246,7 @@ class HierarchicalModel(nn.Module):
     
 
 class GenerativeInfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.05, nce_threshold=0.99):
+    def __init__(self, temperature=0.1, nce_threshold=0.99):
         super().__init__()
         self.temperature = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
         self.nce_threshold = nce_threshold
@@ -249,33 +260,56 @@ class GenerativeInfoNCELoss(nn.Module):
         """
         Parameters
         ----------
-        predictions: (batch, seq_len, hidden)
+        predictions: (batch, seq_len, hidden) or (seq_len, hidden)
             The outputs generated by the UserEncoder, are the next-event embeddings predictions.
-        positives: (batch, seq_len, hidden)
+        positives: (batch, seq_len, hidden) or (seq_len, hidden)
             The positive event embeddings, generated by the EventEncoder, are the inputs of UserEncoder.
         negatives: (batch, num_neg, hidden)
             The sampled negative event embeddings, generated by the EventEncoder.
         attention_mask: (batch, seq_len)
             The attention mask for the inputs to UserEncoder.
         """
-        _, _, hiddens = predictions.shape
-        
-        # postive samples
-        predictions = predictions[:, :-1, :]  # (batch, seq_len-1, hidden)
-        positives = positives[:, 1:, :]       # (batch, seq_len-1, hidden)
-        
         with torch.no_grad():
-            self.temperature.clamp_(0, np.log(100.0))
+            # usually tau is in [0.05, 0.2], 1 / tau in [5, 20]
+            self.temperature.clamp_(0, np.log(50))
         temperature = self.temperature.exp()
 
-        predictions = predictions / predictions.norm(dim=-1, keepdim=True)
-        positives = positives / positives.norm(dim=-1, keepdim=True)
+        hiddens = predictions.size(-1)
+        if predictions.ndim == 3:
+            # postive samples
+            predictions = predictions[:, :-1, :]  # (batch, seq_len-1, hidden)
+            positives = positives[:, 1:, :]       # (batch, seq_len-1, hidden)
+            
+            predictions = predictions / predictions.norm(dim=-1, keepdim=True)
+            positives = positives / positives.norm(dim=-1, keepdim=True)
+
+            # calculate the positive and negative scores
+            # (batch, seq_len-1, 1)
+            pos_scores = F.cosine_similarity(predictions, positives, dim=-1).unsqueeze(-1)
+        else:
+            # predictions and positives not padded into (batch, seq_len, hidden)
+            varlen = attention_mask.sum(dim=-1)
+            varlen_cum = F.pad(varlen, (1, 0), value=0).cumsum(dim=0, dtype=torch.long)
+            # create the mask for predictions and positives
+            seq_len = predictions.size(0)
+            # Create masks more efficiently
+            pred_mask = torch.ones(seq_len, dtype=torch.bool, device=predictions.device)
+            pos_mask = torch.ones(seq_len, dtype=torch.bool, device=positives.device)
+            # mask predictions and positives
+            pred_mask[varlen_cum[1:] - 1] = False
+            pos_mask[varlen_cum[:-1]] = False
+            # apply the mask
+            predictions, positives = predictions[pred_mask], positives[pos_mask]
+            
+            # calculate the positive and negative scores
+            predictions = predictions / predictions.norm(dim=-1, keepdim=True)
+            positives = positives / positives.norm(dim=-1, keepdim=True)
+
+            # calculate the positive and negative scores
+            # (seq_len, 1)
+            pos_scores = F.cosine_similarity(predictions, positives, dim=-1).unsqueeze(-1)
+
         negatives = negatives / negatives.norm(dim=-1, keepdim=True)
-
-        # calculate the positive and negative scores
-        # (batch, seq_len-1, 1)
-        pos_scores = F.cosine_similarity(predictions, positives, dim=-1).unsqueeze(-1)
-
         # gather all negative samples from other devices
         if dist.is_initialized():
             negatives_all = all_gather(negatives, sync_grads=True) # (num_neg, hidden)
@@ -283,14 +317,17 @@ class GenerativeInfoNCELoss(nn.Module):
         else:
             negatives_all = negatives.reshape(-1, hiddens).transpose(-1, -2) # (hidden, num_neg)
         
-        neg_scores = torch.matmul(predictions, negatives_all) # (batch, seq_len-1, num_neg)
+        neg_scores = torch.matmul(predictions, negatives_all) # (..., num_neg)
         # mask scores if the negative is similar to the positive
         mask = torch.matmul(positives, negatives_all) > self.nce_threshold
         neg_scores[mask] = torch.finfo(neg_scores.dtype).min
 
         # calculate the loss
-        logits = torch.cat([pos_scores, neg_scores], dim=-1) # (batch, seq_len-1, num_neg + 1)
-        logits = logits[attention_mask[:, :-1].bool()] * temperature # (batch * (seq_len - 1), num_neg + 1)
+        logits = torch.cat([pos_scores, neg_scores], dim=-1) # (..., num_neg + 1)
+        if logits.ndim == 3:
+            logits = logits[attention_mask[:, :-1].bool()]
+        
+        logits = logits * temperature # (seq_len, num_neg + 1)
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels)
 

@@ -8,7 +8,6 @@ from src.encoder_event import EventEncoder
 from src.hierarchical import HierarchicalModel
 from src.dataset import (
     TextEventSequencePairDataset, 
-    sequential_event_collate_fn,
     build_dataloader
 )
 from src.train import (
@@ -31,26 +30,28 @@ config = TrainingConfig(
     train_data_dir='./data',
     valid_data_dir='./data',
     model_path=ModelPath.Qwen3_1B,
-    shard_size=100,
+    shard_size=1000,
     batch_size=2,
     max_seq_len=32,
     max_text_len=32,
     num_negatives=64,
+    padding=False,
+    add_user_token=True,
     # training args
     name='test',
     log_dir='./logs',
     save_dir='./ckpt',
     learning_rate=1e-5,
-    top_warmup_steps=20,
+    top_warmup_steps=100,
     warmup_steps=100,
-    grad_accum_steps=4,
-    max_steps=120,
-    log_freq=20,
-    eval_steps=60,
-    max_evel_iter=100,
-    temprature=0.05,
+    grad_accum_steps=5,
+    max_steps=200,
+    log_freq=50,
+    eval_steps=200,
+    max_evel_iter=200,
+    temperature=0.1,
     nce_threshold=0.99,
-    nce_loss_lambda=0.5
+    nce_loss_lambda=0.05
 )
 
 def worker_setup(ddp: int, seed: int=42):
@@ -84,8 +85,8 @@ if __name__ == '__main__':
     # build data loader
     train_set = TextEventSequencePairDataset(config, ts_config, split='train', rank=ddp_rank)
     valid_set = TextEventSequencePairDataset(config, ts_config, split='valid', rank=ddp_rank)
-    train_loader = build_dataloader(train_set, config, collate_fn=sequential_event_collate_fn, rank=ddp_rank, num_workers=2)
-    valid_loader = build_dataloader(valid_set, config, collate_fn=sequential_event_collate_fn, rank=ddp_rank, num_workers=2)
+    train_loader = build_dataloader(train_set, config, rank=ddp_rank, num_workers=4)
+    valid_loader = build_dataloader(valid_set, config, rank=ddp_rank, num_workers=4)
 
     # build event encoder
     event_encoder = EventEncoder(
@@ -99,10 +100,9 @@ if __name__ == '__main__':
         ts_config=ts_config
     )
     model = HierarchicalModel(
+        config=config,
         event_encoder=event_encoder,
         user_encoder=user_encoder,
-        temperature=config.temprature,
-        nce_threshold=config.nce_threshold,
         num_classes=1
     )
     model.to(device)

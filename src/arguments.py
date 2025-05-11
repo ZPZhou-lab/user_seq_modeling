@@ -32,7 +32,9 @@ class TrainingConfig:
     max_seq_len: int    = 64
     max_text_len: int   = 32
     num_negatives: int  = 256
+    padding: bool       = True
     EVENT_TOEKN: str = '[EVENT]'
+    add_user_token: bool = True
     # training args
     name: str = 'experiment'
     log_dir: str = './logs'
@@ -46,7 +48,7 @@ class TrainingConfig:
     log_freq: int           = 100
     eval_steps: int         = 100
     max_evel_iter: int      = 1000
-    temprature: float       = 0.05
+    temperature: float      = 0.1
     nce_threshold: float    = 0.99
     nce_loss_lambda: float  = 0.5
 

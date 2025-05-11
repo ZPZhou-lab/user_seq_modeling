@@ -48,13 +48,13 @@ class EventEncoder(nn.Module):
             self.llm = CustomQwen3ForCausalLM.from_pretrained(
                 model_path.value,
                 config=hf_config,
-                torch_dtype='auto', device_map=self.device
+                torch_dtype=torch.bfloat16, device_map=self.device
             ).to(self.device)
         elif model_path.name.startswith("TinyLlama"):
             self.llm = CustomLlamaForCausalLM.from_pretrained(
                 model_path.value,
                 config=hf_config,
-                torch_dtype='auto', device_map=self.device
+                torch_dtype=torch.bfloat16, device_map=self.device
             ).to(self.device)
         # add new embed_tokens to the llm
         self.llm.resize_token_embeddings(len(self.tokenizer) + self.num_add_tokens, mean_resizing=True)
@@ -63,6 +63,7 @@ class EventEncoder(nn.Module):
         input_ids: torch.Tensor, 
         position_ids: torch.Tensor, 
         seq_varlen: torch.Tensor,
+        is_padded: bool = True,
         seq_len: int = None
     ) -> torch.Tensor:
         """
@@ -77,6 +78,9 @@ class EventEncoder(nn.Module):
             The position ids of the events with shape (sql_len, )
         seq_varlen: torch.Tensor
             The variable length of the event sequences with shape (batch, )
+        is_padded: bool
+            Whether the input_ids is padded. If `True`, the outputs can be reshaped to (batch, max_seq_len, hiddens).\
+            If `False`, the outputs should be reshaped to (num_events, hiddens).
         seq_len: int
             To reshape the output hidden_states to (batch, seq_len, hiddens). If None, the output will be (batch, max_seq_len, hiddens).
         """
@@ -88,15 +92,15 @@ class EventEncoder(nn.Module):
         # using flash-attention to get the hidden states
         hidden_states = self.llm.base_model(
             inputs_embeds=hidden_states.unsqueeze(0), 
-            cu_input_lens=seq_varlen.to(self.llm.device),
-            position_ids=position_ids.unsqueeze(0).to(self.llm.device)
+            cu_input_lens=seq_varlen,
+            position_ids=position_ids.unsqueeze(0)
         ).last_hidden_state
 
         # extract the last token hidden state and reshape it to (batch, seq_len, hidden)
-        hidden_states = hidden_states[:, seq_varlen_cum - 1, :].squeeze(0)
-        if seq_len is None:
-            seq_len = self.max_seq_len
-        hidden_states = hidden_states.view(-1, seq_len, embed_size)
+        hidden_states = hidden_states[:, seq_varlen_cum - 1, :].squeeze(0) # (num_events, hiddens)
+        if is_padded:
+            seq_len = self.max_seq_len if seq_len is None else seq_len
+            hidden_states = hidden_states.view(-1, seq_len, embed_size)
 
         return hidden_states
 

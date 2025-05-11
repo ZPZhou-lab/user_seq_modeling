@@ -43,7 +43,8 @@ class EventSequenceDataLoaderMeta:
         self.tokenizer.add_tokens(config.EVENT_TOEKN, special_tokens=True)
         self.tokenizer.padding_side = "left"
         self.num_negatives = math.ceil(config.num_negatives / (self.batch_size * self.world_size))
-
+        self.EVENT_TOKEN = None
+        
         # preload metadata
         self._preload_dataset()
         self.curr_shard_idx = 0
@@ -154,6 +155,10 @@ class EventSequenceDataLoaderMeta:
             mask = [0] * pad_len + mask
 
         return event_seq, mask
+
+    @abstractmethod
+    def sequential_event_collate_fn(self, samples):
+        raise NotImplementedError("Please implement collate_fn method in the subclass.")
     
     def reset(self):
         """
@@ -205,9 +210,8 @@ class EventSequencePairLoaaderWrapper:
 
 
 def build_dataloader(
-    dataset,
+    dataset: EventSequenceDataLoaderMeta,
     config: TrainingConfig, 
-    collate_fn: callable,
     rank: int=0,
     **kwargs
 ):
@@ -216,7 +220,7 @@ def build_dataloader(
         dataset,
         batch_size=config.batch_size,
         sampler=sampler,
-        collate_fn=collate_fn,
+        collate_fn=dataset.sequential_event_collate_fn,
         num_workers=kwargs.get('num_workers', 0),
         pin_memory=kwargs.get('pin_memory', True),
         multiprocessing_context=kwargs.get('multiprocessing_context', None),

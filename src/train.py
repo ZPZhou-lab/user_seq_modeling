@@ -172,6 +172,7 @@ def train_step(
         batch = next(train_loader)
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         batch['num_negatives'] = train_loader.num_negatives
+        batch['is_padded'] = config.padding
         
         # set gradient sync
         if ddp:
@@ -216,6 +217,8 @@ def train_step(
         if tb_logger.trigger_logger(step):
             metrics = tb_logger.values
             metrics['learning_rate'] = lr_scheduler.get_lr()
+            raw_model = model.module if ddp else model
+            metrics['temperature'] = raw_model.temperature
             tb_logger.log(metrics, step, prefix="train")
 
 
@@ -243,6 +246,7 @@ def valid_context(
             batch = next(valid_loader)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             batch['num_negatives'] = valid_loader.num_negatives
+            batch['is_padded'] = config.padding
             
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 # call model
